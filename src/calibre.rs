@@ -102,7 +102,11 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
 }
 
 /// Lists all books with their attributes.
-pub fn list_books(conn: &Connection, appdb_conn: Option<&Connection>) -> Result<()> {
+pub fn list_books(
+    conn: &Connection,
+    appdb_conn: Option<&Connection>,
+    shelf_name: Option<&str>,
+) -> Result<()> {
     struct BookInfo {
         id: i64,
         title: String,
@@ -111,10 +115,44 @@ pub fn list_books(conn: &Connection, appdb_conn: Option<&Connection>) -> Result<
         path: String,
     }
 
-    let mut stmt = conn
-        .prepare("SELECT id, title, pubdate, series_index, path FROM books ORDER BY title")?;
+    let book_ids_on_shelf = if let Some(shelf) = shelf_name {
+        let appdb = appdb_conn.context("app.db connection is required to filter by shelf")?;
+        let mut stmt = appdb.prepare(
+            "SELECT bsl.book_id FROM book_shelf_link bsl
+             JOIN shelf s ON s.id = bsl.shelf
+             WHERE s.name = ?1",
+        )?;
+        let ids_iter = stmt.query_map(params![shelf], |row| row.get(0))?;
+        let ids = ids_iter.collect::<Result<Vec<i64>, _>>()?;
 
-    let book_iter = stmt.query_map([], |row| {
+        if ids.is_empty() {
+            println!("No books found on shelf '{}'.", shelf);
+            return Ok(());
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let sql = if let Some(ids) = &book_ids_on_shelf {
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        format!(
+            "SELECT id, title, pubdate, series_index, path FROM books WHERE id IN ({}) ORDER BY title",
+            placeholders
+        )
+    } else {
+        "SELECT id, title, pubdate, series_index, path FROM books ORDER BY title".to_string()
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let params_vec: Vec<&dyn rusqlite::ToSql> = if let Some(ids) = &book_ids_on_shelf {
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect()
+    } else {
+        vec![]
+    };
+
+    let book_iter = stmt.query_map(&params_vec[..], |row| {
         Ok(BookInfo {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -123,14 +161,26 @@ pub fn list_books(conn: &Connection, appdb_conn: Option<&Connection>) -> Result<
             path: row.get(4)?,
         })
     })?;
-    
-    println!("📚 Listing all books in the library...\n");
 
-    let mut shelf_stmt = appdb_conn.map(|db| {
-        db.prepare("SELECT s.name FROM shelf s JOIN book_shelf_link bsl ON s.id = bsl.shelf WHERE bsl.book_id = ?1")
-    }).transpose()?;
+    if let Some(shelf) = shelf_name {
+        println!("📚 Listing books on shelf '{}'...
+", shelf);
+    } else {
+        println!("📚 Listing all books in the library...
+");
+    }
 
+    let mut shelf_stmt = appdb_conn
+        .map(|db| {
+            db.prepare(
+                "SELECT s.name FROM shelf s JOIN book_shelf_link bsl ON s.id = bsl.shelf WHERE bsl.book_id = ?1",
+            )
+        })
+        .transpose()?;
+
+    let mut count = 0;
     for book_result in book_iter {
+        count += 1;
         let book = book_result?;
         println!("{}", "─".repeat(80));
         println!("ID:          {}", book.id);
@@ -156,16 +206,20 @@ pub fn list_books(conn: &Connection, appdb_conn: Option<&Connection>) -> Result<
         if !tags.is_empty() {
             println!("Tags:        {}", tags.join(", "));
         }
-        
-        let publisher = get_linked_items(conn, "publishers", "books_publishers_link", "publisher", book.id)?;
+
+        let publisher =
+            get_linked_items(conn, "publishers", "books_publishers_link", "publisher", book.id)?;
         if !publisher.is_empty() {
             println!("Publisher:   {}", publisher.join(", "));
         }
-        
+
         println!("Published:   {}", book.pubdate.format("%Y-%m-%d"));
         println!("Path:        {}", book.path);
     }
-    println!("{}", "─".repeat(80));
+    
+    if count > 0 {
+        println!("{}", "─".repeat(80));
+    }
 
     Ok(())
 }
