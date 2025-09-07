@@ -16,21 +16,23 @@ pub fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
 
 /// Lists all unique shelves from the Calibre-Web app.db.
 pub fn list_shelves(appdb_conn: Option<&Connection>) -> Result<()> {
-    let conn = appdb_conn.context("The --appdb-file argument is required to list shelves.")?;
+    if let Some(conn) = appdb_conn {
+        println!("📖 Finding available shelves from Calibre-Web...");
 
-    println!("📖 Finding available shelves from Calibre-Web...");
+        let mut stmt = conn.prepare("SELECT id, name FROM shelf ORDER BY name")?;
+        let shelves_iter = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let shelves: Vec<(i64, String)> = shelves_iter.collect::<Result<Vec<(i64, String)>, _>>()?;
 
-    let mut stmt = conn.prepare("SELECT id, name FROM shelf ORDER BY name")?;
-    let shelves_iter = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
-    let shelves: Vec<(i64, String)> = shelves_iter.collect::<Result<Vec<(i64, String)>, _>>()?;
-
-    if shelves.is_empty() {
-        println!("\nNo shelves found in the Calibre-Web database.");
-    } else {
-        println!("\nAvailable shelves:");
-        for (id, shelf) in shelves {
-            println!("- {} (ID: {})", shelf, id);
+        if shelves.is_empty() {
+            println!("\nNo shelves found in the Calibre-Web database.");
+        } else {
+            println!("\nAvailable shelves:");
+            for (id, shelf) in shelves {
+                println!("- {} (ID: {})", shelf, id);
+            }
         }
+    } else {
+        anyhow::bail!("The --appdb-file argument is required to list shelves.");
     }
 
     Ok(())

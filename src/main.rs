@@ -12,39 +12,42 @@ mod calibre;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let metadata_file = cli.metadata_file.context("--metadata-file is required")?;
+
     // Validate library database file path for all commands
-    if !cli.metadata_file.exists() {
+    if !metadata_file.exists() {
         anyhow::bail!(
             "The specified library database file does not exist: {:?}",
-            cli.metadata_file
+            metadata_file
         );
     }
 
-    let mut calibre_conn = Connection::open(&cli.metadata_file)
-        .with_context(|| format!("Failed to open Calibre database at {:?}", cli.metadata_file))?;
+    let mut calibre_conn = Connection::open(&metadata_file)
+        .with_context(|| format!("Failed to open Calibre database at {:?}", metadata_file))?;
 
     // Add the custom title_sort function that Calibre's triggers need
     calibre::create_calibre_functions(&calibre_conn)?;
 
+    let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
+
     match cli.command {
-        Commands::Add { epub_file, appdb_file, shelf } => {
-            let mut appdb_conn = appdb::open_appdb(appdb_file.as_deref())?;
-            add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &cli.metadata_file, &epub_file, shelf.as_deref())?;
+        Commands::Add { shelf } => {
+            if shelf.is_some() && cli.appdb_file.is_none() {
+                anyhow::bail!("--appdb-file is required when specifying a shelf");
+            }
+            let epub_file = cli.epub_file.context("--epub-file is required for the add command")?;
+            add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file, &epub_file, shelf.as_deref())?;
         }
-        Commands::List { appdb_file } => {
-            let appdb_conn = appdb::open_appdb(appdb_file.as_deref())?;
+        Commands::List => {
             calibre::list_books(&calibre_conn, appdb_conn.as_ref())?;
         }
-        Commands::ListShelves { appdb_file } => {
-            let appdb_conn = appdb::open_appdb(Some(&appdb_file))?;
+        Commands::ListShelves => {
             appdb::list_shelves(appdb_conn.as_ref())?;
         }
-        Commands::Delete { book_id, appdb_file } => {
-            let appdb_conn = appdb::open_appdb(appdb_file.as_deref())?;
-            calibre::delete_book(&mut calibre_conn, appdb_conn.as_ref(), &cli.metadata_file, book_id)?;
+        Commands::Delete { book_id } => {
+            calibre::delete_book(&mut calibre_conn, appdb_conn.as_ref(), &metadata_file, book_id)?;
         }
-        Commands::CleanShelves { appdb_file } => {
-            let appdb_conn = appdb::open_appdb(Some(&appdb_file))?;
+        Commands::CleanShelves => {
             if let Some(conn) = appdb_conn {
                 appdb::clean_empty_shelves(&conn, &calibre_conn)?;
             }
