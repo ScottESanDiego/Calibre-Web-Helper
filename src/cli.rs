@@ -9,7 +9,7 @@ pub struct Cli {
     #[clap(long, value_parser, global = true)]
     pub metadata_file: Option<PathBuf>,
 
-    /// Path to the Calibre-Web app.db file for shelf management.
+    /// Path to the Calibre-Web database file (app.db) for shelf management.
     #[clap(long, global = true)]
     pub appdb_file: Option<PathBuf>,
 
@@ -35,14 +35,14 @@ pub enum Commands {
         #[clap(long)]
         shelf: Option<String>,
     },
-    /// List all available shelves from the Calibre-Web database
-    ListShelves,
     /// Delete a book from the library by its ID. Also removes it from Calibre-Web shelves.
     Delete {
         /// The ID of the book to delete.
         #[clap(value_parser)]
         book_id: i64,
     },
+    /// List all available shelves from the Calibre-Web database
+    ListShelves,
     /// Remove any shelves that don't have any books on them.
     CleanShelves,
     /// Inspect the app.db database
