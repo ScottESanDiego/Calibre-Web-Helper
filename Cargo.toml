@@ -1,7 +1,14 @@
 [package]
 name = "calibre-web-helper"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+authors = ["ScottESanDiego"]
+edition = "2024"
+rust-version = "1.85"  # Minimum supported Rust version (required for 2024 edition)
+description = "A helper tool for managing Calibre and Calibre-Web libraries"
+license = "MIT"
+repository = "https://github.com/ScottESanDiego/Calibre-Web-Helper"
+categories = ["command-line-utilities"]
+keywords = ["calibre", "ebook", "epub", "library", "metadata"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
