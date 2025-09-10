@@ -83,7 +83,20 @@ fn add_book_flow(
     }
 
     println!("📚 Reading EPUB metadata...");
-    let metadata = epub::get_epub_metadata(epub_file)?;
+    let mut metadata = epub::get_epub_metadata(epub_file)?;
+
+    // Normalize language to "eng" if it's an English variant
+    if let Some(lang) = &metadata.language {
+        let normalized_lang = match lang.to_lowercase().as_str() {
+            "en" | "en-us" | "en_us" | "en-gb" | "en_gb" => Some("eng".to_string()),
+            _ => None,
+        };
+        if normalized_lang.is_some() {
+            println!(" -> Normalizing language from {:?} to {:?}", metadata.language, normalized_lang);
+            metadata.language = normalized_lang;
+        }
+    }
+
     println!(" -> Title: {}", metadata.title);
     println!(" -> Author: {}", metadata.author);
 
