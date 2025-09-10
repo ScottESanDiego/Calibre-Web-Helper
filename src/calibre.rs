@@ -7,6 +7,11 @@ use uuid::Uuid;
 pub struct BookMetadata {
     pub title: String,
     pub author: String,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub isbn: Option<String>,
+    pub rights: Option<String>,
+    pub subtitle: Option<String>,
 }
 
 pub enum UpsertResult {
@@ -96,25 +101,67 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         params![book_id, "EPUB", 0, &safe_title], // Size 0 is fine, Calibre updates it.
     )?;
 
+    // 6. Add other metadata
+    let mut comment_parts = Vec::new();
+    if let Some(subtitle) = &metadata.subtitle {
+        comment_parts.push(format!("<h3>{}</h3>", subtitle));
+    }
+    if let Some(description) = &metadata.description {
+        comment_parts.push(description.to_string());
+    }
+    if let Some(rights) = &metadata.rights {
+        comment_parts.push(format!("<p>Rights: {}</p>", rights));
+    }
+
+    if !comment_parts.is_empty() {
+        let comment_text = comment_parts.join("\n");
+        tx.execute(
+            "INSERT INTO comments (book, text) VALUES (?1, ?2)",
+            params![book_id, comment_text],
+        )?;
+    }
+    if let Some(language) = &metadata.language {
+        let lang_id: i64 = match tx.query_row(
+            "SELECT id FROM languages WHERE lang_code = ?1",
+            params![language],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tx.execute(
+                    "INSERT INTO languages (lang_code) VALUES (?1)",
+                    params![language],
+                )?;
+                tx.last_insert_rowid()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        tx.execute(
+            "INSERT INTO books_languages_link (book, lang_code) VALUES (?1, ?2)",
+            params![book_id, lang_id],
+        )?;
+    }
+    if let Some(isbn) = &metadata.isbn {
+        tx.execute(
+            "INSERT INTO identifiers (book, type, val) VALUES (?1, 'isbn', ?2)",
+            params![book_id, isbn],
+        )?;
+    }
+
     tx.commit()?;
 
     Ok(UpsertResult::Created { book_id, book_path })
 }
+
 
 /// Lists all books with their attributes.
 pub fn list_books(
     conn: &Connection,
     appdb_conn: Option<&Connection>,
     shelf_name: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
-    struct BookInfo {
-        id: i64,
-        title: String,
-        pubdate: DateTime<Utc>,
-        series_index: f64,
-        path: String,
-    }
-
     let book_ids_on_shelf = if let Some(shelf) = shelf_name {
         let appdb = appdb_conn.context("app.db connection is required to filter by shelf")?;
         let mut stmt = appdb.prepare(
@@ -137,11 +184,11 @@ pub fn list_books(
     let sql = if let Some(ids) = &book_ids_on_shelf {
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         format!(
-            "SELECT id, title, pubdate, series_index, path FROM books WHERE id IN ({}) ORDER BY title",
+            "SELECT * FROM books WHERE id IN ({}) ORDER BY title",
             placeholders
         )
     } else {
-        "SELECT id, title, pubdate, series_index, path FROM books ORDER BY title".to_string()
+        "SELECT * FROM books ORDER BY title".to_string()
     };
 
     let mut stmt = conn.prepare(&sql)?;
@@ -152,15 +199,7 @@ pub fn list_books(
         vec![]
     };
 
-    let book_iter = stmt.query_map(&params_vec[..], |row| {
-        Ok(BookInfo {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            pubdate: row.get(2)?,
-            series_index: row.get(3)?,
-            path: row.get(4)?,
-        })
-    })?;
+    let mut rows = stmt.query(&params_vec[..])?;
 
     if let Some(shelf) = shelf_name {
         println!("📚 Listing books on shelf '{}'...
@@ -179,42 +218,63 @@ pub fn list_books(
         .transpose()?;
 
     let mut count = 0;
-    for book_result in book_iter {
+    while let Some(row) = rows.next()? {
         count += 1;
-        let book = book_result?;
         println!("{}", "─".repeat(80));
-        println!("ID:          {}", book.id);
-        println!("Title:       {}", book.title);
+        let id: i64 = row.get("id")?;
+        println!("ID:          {}", id);
+        println!("Title:       {}", row.get::<_, String>("title")?);
 
-        let authors = get_linked_items(conn, "authors", "books_authors_link", "author", book.id)?;
+        let authors = get_linked_items(conn, "authors", "books_authors_link", "author", id)?;
         println!("Authors:     {}", authors.join(" & "));
 
         if let Some(stmt) = &mut shelf_stmt {
-            let shelves_iter = stmt.query_map(params![book.id], |row| row.get(0))?;
+            let shelves_iter = stmt.query_map(params![id], |row| row.get(0))?;
             let shelves: Vec<String> = shelves_iter.collect::<Result<Vec<_>, _>>()?;
             if !shelves.is_empty() {
                 println!("Shelves:     {}", shelves.join(", "));
             }
         }
 
-        let series = get_linked_items(conn, "series", "books_series_link", "series", book.id)?;
+        let series = get_linked_items(conn, "series", "books_series_link", "series", id)?;
         if !series.is_empty() {
-            println!("Series:      {} (#{})", series.join(", "), book.series_index);
+            println!("Series:      {} (#{})", series.join(", "), row.get::<_, f64>("series_index")?);
         }
 
-        let tags = get_linked_items(conn, "tags", "books_tags_link", "tag", book.id)?;
+        let tags = get_linked_items(conn, "tags", "books_tags_link", "tag", id)?;
         if !tags.is_empty() {
             println!("Tags:        {}", tags.join(", "));
         }
 
         let publisher =
-            get_linked_items(conn, "publishers", "books_publishers_link", "publisher", book.id)?;
+            get_linked_items(conn, "publishers", "books_publishers_link", "publisher", id)?;
         if !publisher.is_empty() {
             println!("Publisher:   {}", publisher.join(", "));
         }
 
-        println!("Published:   {}", book.pubdate.format("%Y-%m-%d"));
-        println!("Path:        {}", book.path);
+        println!("Published:   {}", row.get::<_, DateTime<Utc>>("pubdate")?.format("%Y-%m-%d"));
+        println!("Path:        {}", row.get::<_, String>("path")?);
+
+        if verbose {
+            println!("Sort:        {}", row.get::<_, String>("sort")?);
+            println!("Author Sort: {}", row.get::<_, String>("author_sort")?);
+            println!("Timestamp:   {}", row.get::<_, DateTime<Utc>>("timestamp")?);
+            println!("Last Mod:    {}", row.get::<_, DateTime<Utc>>("last_modified")?);
+            println!("UUID:        {}", row.get::<_, String>("uuid")?);
+            println!("Has Cover:   {}", row.get::<_, bool>("has_cover")?);
+
+            if let Some(language) = get_book_language(conn, id)? {
+                println!("Language:    {}", language);
+            }
+
+            let identifiers = get_book_identifiers(conn, id)?;
+            if !identifiers.is_empty() {
+                println!("Identifiers:");
+                for (id_type, id_val) in identifiers {
+                    println!("  {}: {}", id_type, id_val);
+                }
+            }
+        }
     }
     
     if count > 0 {
@@ -379,4 +439,24 @@ fn get_author_sort(author: &str) -> String {
     } else {
         author.to_string()
     }
+}
+
+/// Helper function to get the language of a book.
+fn get_book_language(conn: &Connection, book_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT l.lang_code FROM languages l JOIN books_languages_link bll ON l.id = bll.lang_code WHERE bll.book = ?1",
+        params![book_id],
+        |row| row.get(0),
+    ).optional().map_err(Into::into)
+}
+
+/// Helper function to get the identifiers of a book.
+fn get_book_identifiers(conn: &Connection, book_id: i64) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT type, val FROM identifiers WHERE book = ?1",
+    )?;
+    let identifiers_iter = stmt.query_map(params![book_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    identifiers_iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }

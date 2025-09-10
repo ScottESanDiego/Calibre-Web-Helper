@@ -38,8 +38,8 @@ fn main() -> Result<()> {
             let epub_file = cli.epub_file.context("--epub-file is required for the add command")?;
             add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file, &epub_file, shelf.as_deref())?;
         }
-        Commands::List { shelf } => {
-            calibre::list_books(&calibre_conn, appdb_conn.as_ref(), shelf.as_deref())?;
+        Commands::List { shelf, verbose } => {
+            calibre::list_books(&calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), verbose)?;
         }
         Commands::ListShelves => {
             appdb::list_shelves(appdb_conn.as_ref())?;

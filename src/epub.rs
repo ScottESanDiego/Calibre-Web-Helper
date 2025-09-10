@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::calibre::BookMetadata;
 
-/// Extracts title and author from the EPUB file.
+/// Extracts full metadata from the EPUB file.
 pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     let doc = epub::doc::EpubDoc::new(path)?;
     let title = doc
@@ -13,7 +13,35 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     let author = doc
         .mdata("creator")
         .context("EPUB has no author (creator) metadata")?;
-    Ok(BookMetadata { title, author })
+    let description = doc.mdata("description");
+    let rights = doc.mdata("rights");
+    let subtitle = doc.mdata("subtitle");
+
+    let language = doc.mdata("language");
+
+    let isbn = doc.metadata.get("identifier").and_then(|identifiers| {
+        identifiers.iter().find_map(|id| {
+            let id = id.trim();
+            if id.starts_with("urn:isbn:") {
+                return Some(id.trim_start_matches("urn:isbn:").to_string());
+            }
+            let digits: String = id.chars().filter(|c| c.is_digit(10)).collect();
+            if digits.len() == 10 || digits.len() == 13 {
+                return Some(digits);
+            }
+            None
+        })
+    });
+
+    Ok(BookMetadata {
+        title,
+        author,
+        description,
+        language,
+        isbn,
+        rights,
+        subtitle,
+    })
 }
 
 /// Copies or updates the EPUB file in the Calibre library structure.

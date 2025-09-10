@@ -34,6 +34,9 @@ pub enum Commands {
         /// The name of the shelf to filter by.
         #[clap(long)]
         shelf: Option<String>,
+        /// List all attributes for each book.
+        #[clap(long)]
+        verbose: bool,
     },
     /// Delete a book from the library by its ID. Also removes it from Calibre-Web shelves.
     Delete {
