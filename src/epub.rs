@@ -33,6 +33,44 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         })
     });
 
+    // Extract series information from metadata
+    // Look for calibre:series and calibre:series_index first
+    let series = doc.mdata("calibre:series")
+        .or_else(|| {
+            // Fallback to looking for series information in the title
+            // Common format: Series Name #X - Book Title
+            let title = title.trim();
+            if let Some(hash_idx) = title.find('#') {
+                if let Some(_dash_idx) = title[hash_idx..].find('-') {
+                    // Extract everything before the # as the series name
+                    let series_part = title[..hash_idx].trim();
+                    if !series_part.is_empty() {
+                        Some(series_part.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+    let series_index = doc.mdata("calibre:series_index")
+        .and_then(|idx| idx.parse::<f64>().ok())
+        .or_else(|| {
+            // Try to extract series index from title if in #X format
+            title.find('#')
+                .and_then(|i| {
+                    let rest = &title[i + 1..];
+                    let num_str: String = rest.chars()
+                        .take_while(|c| c.is_digit(10) || *c == '.')
+                        .collect();
+                    num_str.parse::<f64>().ok()
+                })
+        });
+
     Ok(BookMetadata {
         title,
         author,
@@ -41,6 +79,8 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         isbn,
         rights,
         subtitle,
+        series,
+        series_index,
     })
 }
 

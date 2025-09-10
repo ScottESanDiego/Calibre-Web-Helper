@@ -12,6 +12,8 @@ pub struct BookMetadata {
     pub isbn: Option<String>,
     pub rights: Option<String>,
     pub subtitle: Option<String>,
+    pub series: Option<String>,
+    pub series_index: Option<f64>,
 }
 
 pub enum UpsertResult {
@@ -36,10 +38,63 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         // UPDATE PATH
         println!(" -> Found existing book with ID: {}. Updating.", book_id);
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
+        
+        // Update the last_modified timestamp
         tx.execute(
             "UPDATE books SET last_modified = ?1 WHERE id = ?2",
             params![&now_str, book_id],
         )?;
+
+        // Update series information
+        if let Some(series_name) = &metadata.series {
+            // Get or create series entry
+            let series_id: i64 = match tx.query_row(
+                "SELECT id FROM series WHERE name = ?1",
+                params![series_name],
+                |row| row.get(0),
+            ) {
+                Ok(id) => id,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    tx.execute(
+                        "INSERT INTO series (name, sort) VALUES (?1, ?2)",
+                        params![series_name, series_name], // Using same value for sort
+                    )?;
+                    tx.last_insert_rowid()
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // Remove any existing series links
+            tx.execute(
+                "DELETE FROM books_series_link WHERE book = ?1",
+                params![book_id],
+            )?;
+
+            // Link book to series
+            tx.execute(
+                "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
+                params![book_id, series_id],
+            )?;
+
+            // Set series index in books table
+            if let Some(index) = metadata.series_index {
+                tx.execute(
+                    "UPDATE books SET series_index = ?1 WHERE id = ?2",
+                    params![index, book_id],
+                )?;
+            }
+        } else {
+            // If no series info provided, remove any existing series information
+            tx.execute(
+                "DELETE FROM books_series_link WHERE book = ?1",
+                params![book_id],
+            )?;
+            tx.execute(
+                "UPDATE books SET series_index = NULL WHERE id = ?1",
+                params![book_id],
+            )?;
+        }
+
         tx.commit()?;
         return Ok(UpsertResult::Updated { book_id, book_path });
     }
@@ -147,6 +202,40 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
             "INSERT INTO identifiers (book, type, val) VALUES (?1, 'isbn', ?2)",
             params![book_id, isbn],
         )?;
+    }
+
+    // Handle series information
+    if let Some(series_name) = &metadata.series {
+        // Get or create series entry
+        let series_id: i64 = match tx.query_row(
+            "SELECT id FROM series WHERE name = ?1",
+            params![series_name],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tx.execute(
+                    "INSERT INTO series (name, sort) VALUES (?1, ?2)",
+                    params![series_name, series_name], // Using same value for sort
+                )?;
+                tx.last_insert_rowid()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Link book to series
+        tx.execute(
+            "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
+            params![book_id, series_id],
+        )?;
+
+        // Set series index in books table
+        if let Some(index) = metadata.series_index {
+            tx.execute(
+                "UPDATE books SET series_index = ?1 WHERE id = ?2",
+                params![index, book_id],
+            )?;
+        }
     }
 
     tx.commit()?;

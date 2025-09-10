@@ -99,6 +99,10 @@ fn add_book_flow(
 
     println!(" -> Title: {}", metadata.title);
     println!(" -> Author: {}", metadata.author);
+    if let Some(series) = &metadata.series {
+        println!(" -> Series: {} {}", series, 
+            metadata.series_index.map_or(String::new(), |idx| format!("#{}", idx)));
+    }
 
     println!("✒️ Writing to Calibre database...");
     let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata)?;
@@ -135,8 +139,17 @@ fn add_book_flow(
     }
 
     let action_str = if is_update { "updated in" } else { "added to" };
+    // Check series status for feedback message
+    let series_msg = if let Some(series) = &metadata.series {
+        format!(" (part of series '{}'{})'", series,
+            metadata.series_index.map_or(String::new(), |idx| format!(" #{}", idx)))
+    } else {
+        String::new()
+    };
+
     println!("
-✅ Success! '{}' has been {} your Calibre library.", metadata.title, action_str);
+✅ Success! '{}'{} has been {} your Calibre library.",
+        metadata.title, series_msg, action_str);
 
     println!("   Please restart Calibre to see the new book.");
 
