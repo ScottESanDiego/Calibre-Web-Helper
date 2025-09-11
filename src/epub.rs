@@ -178,11 +178,6 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
                 })
         });
 
-    // Get the original filename
-    let original_filename = path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .context("Could not get filename from EPUB path")?;
-
     // Get the file size
     let file_size = std::fs::metadata(path)
         .with_context(|| format!("Failed to get file size for {:?}", path))?
@@ -200,7 +195,6 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         series_index,
         publisher,
         pubdate,
-        original_filename,
         file_size,
     })
 }
@@ -227,9 +221,9 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
     fs::create_dir_all(&dest_dir)
         .with_context(|| format!("Failed to create directory: {:?}", dest_dir))?;
 
-    let epub_filename = epub_file
-        .file_name()
-        .context("Could not get filename from EPUB path")?;
+    // Read the metadata to get title and author for the filename
+    let metadata = get_epub_metadata(epub_file)?;
+    let epub_filename = format!("{} - {}.epub", metadata.title, metadata.author);
     let dest_file = dest_dir.join(epub_filename);
     fs::copy(epub_file, &dest_file)
         .with_context(|| format!("Failed to copy EPUB to {:?}", dest_file))?;

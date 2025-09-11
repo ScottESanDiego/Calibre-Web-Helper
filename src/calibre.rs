@@ -16,7 +16,6 @@ pub struct BookMetadata {
     pub series_index: Option<f64>,
     pub publisher: Option<String>,
     pub pubdate: Option<DateTime<Utc>>,
-    pub original_filename: String,
     pub file_size: u64,
 }
 
@@ -41,11 +40,11 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     if let Some((book_id, book_path)) = existing_book {
         // UPDATE PATH
         println!(" -> Found existing book with ID: {}. Updating.", book_id);
-        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
+        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f").to_string();
         
         // Get the pubdate string
         let pubdate_str = metadata.pubdate.map(|dt| 
-            dt.format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string()
+            dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
         );
         
         // Update the timestamps and pubdate if provided
@@ -167,10 +166,10 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     // 2. Insert the book record (with a temporary path)
     // Calibre expects timestamps with microsecond precision.
     let now = Utc::now();
-    let now_str = now.format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
+    let now_str = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
     let pubdate_str = metadata.pubdate
         .unwrap_or(now)
-        .format("%Y-%m-%d %H:%M:%S.%6f+00:00")
+        .format("%Y-%m-%d %H:%M:%S.%6f")
         .to_string();
         
     tx.execute(
@@ -202,9 +201,11 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     )?;
 
     // 5. Add the file format information to the 'data' table
+    // Format filename as "Title - Author" for the database
+    let epub_name = format!("{} - {}", metadata.title, metadata.author);
     tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-        params![book_id, "EPUB", metadata.file_size, &metadata.original_filename],
+        params![book_id, "EPUB", metadata.file_size, epub_name],
     )?;
 
     // 6. Add other metadata
@@ -250,7 +251,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     }
     if let Some(isbn) = &metadata.isbn {
         tx.execute(
-            "INSERT INTO identifiers (book, type, val) VALUES (?1, 'isbn', ?2)",
+            "INSERT INTO identifiers (book, type, val) VALUES (?1, 'ISBN', ?2)",
             params![book_id, isbn],
         )?;
     }
