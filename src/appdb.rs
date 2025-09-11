@@ -39,24 +39,38 @@ pub fn list_shelves(appdb_conn: Option<&Connection>) -> Result<()> {
 }
 
 /// Adds a book to a shelf in the Calibre-Web database. Creates the shelf if it doesn't exist.
-pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_name: &str) -> Result<()> {
+pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
     let tx = conn.transaction()?;
+
+    // Get the user_id, defaulting to admin (id=1) if no username is provided
+    let user_id = if let Some(uname) = username {
+        match tx.query_row(
+            "SELECT id FROM user WHERE name = ?1",
+            params![uname],
+            |row| row.get::<_, i64>(0),
+        ).optional()? {
+            Some(id) => id,
+            None => anyhow::bail!("User '{}' not found", uname),
+        }
+    } else {
+        1 // Default admin user
+    };
 
     // 1. Find or create the shelf
     let shelf_id: i64 = match tx.query_row(
-        "SELECT id FROM shelf WHERE name = ?1",
-        params![shelf_name],
+        "SELECT id FROM shelf WHERE name = ?1 AND user_id = ?2",
+        params![shelf_name, user_id],
         |row| row.get(0),
     ).optional()? {
         Some(id) => id,
         None => {
-            // Shelf doesn't exist, create it.
-            // Calibre-Web seems to require a user_id, we'll default to 1 (usually the admin).
+            // Shelf doesn't exist, create it for the specific user
             tx.execute(
-                "INSERT INTO shelf (name, is_public, user_id) VALUES (?1, 0, 1)",
-                params![shelf_name],
+                "INSERT INTO shelf (name, is_public, user_id) VALUES (?1, 0, ?2)",
+                params![shelf_name, user_id],
             )?;
-            println!(" -> Created new shelf '{}'.", shelf_name);
+            println!(" -> Created new shelf '{}' for user {}.", shelf_name, 
+                    username.unwrap_or("admin"));
             tx.last_insert_rowid()
         }
     };

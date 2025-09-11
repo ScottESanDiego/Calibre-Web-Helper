@@ -31,12 +31,12 @@ fn main() -> Result<()> {
     let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
 
     match cli.command {
-        Commands::Add { shelf } => {
+        Commands::Add { shelf, username } => {
             if shelf.is_some() && cli.appdb_file.is_none() {
                 anyhow::bail!("--appdb-file is required when specifying a shelf");
             }
             let epub_file = cli.epub_file.context("--epub-file is required for the add command")?;
-            add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file, &epub_file, shelf.as_deref())?;
+            add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
         }
         Commands::List { shelf, verbose } => {
             calibre::list_books(&calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), verbose)?;
@@ -77,6 +77,7 @@ fn add_book_flow(
     library_db_path: &Path,
     epub_file: &Path,
     shelf_name: Option<&str>,
+    username: Option<&str>,
 ) -> Result<()> {
     if !epub_file.exists() {
         anyhow::bail!("The specified EPUB file does not exist.");
@@ -122,7 +123,7 @@ fn add_book_flow(
 
     // Clap's `requires` attribute ensures appdb_conn is Some if shelf_name is Some.
     if let (Some(name), Some(conn)) = (shelf_name, appdb_conn) {
-    appdb::add_book_to_shelf_in_appdb(conn, book_id, name)?;
+        appdb::add_book_to_shelf_in_appdb(conn, book_id, name, username)?;
     }
 
     println!("🚚 Updating files in library...");
