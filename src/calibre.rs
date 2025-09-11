@@ -16,6 +16,7 @@ pub struct BookMetadata {
     pub series_index: Option<f64>,
     pub publisher: Option<String>,
     pub pubdate: Option<DateTime<Utc>>,
+    pub original_filename: String,
 }
 
 pub enum UpsertResult {
@@ -186,9 +187,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     let book_id = tx.last_insert_rowid();
 
     // 3. Construct the final path and update the book record with it
-    let safe_title = slug::slugify(&metadata.title);
-    let safe_author = slug::slugify(&metadata.author);
-    let book_path = format!("{}/{} ({})", safe_author, safe_title, book_id);
+    let book_path = format!("{}/{} ({})", metadata.author, metadata.title, book_id);
 
     tx.execute(
         "UPDATE books SET path = ?1 WHERE id = ?2",
@@ -204,7 +203,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     // 5. Add the file format information to the 'data' table
     tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-        params![book_id, "EPUB", 0, &safe_title], // Size 0 is fine, Calibre updates it.
+        params![book_id, "EPUB", 0, &metadata.original_filename], // Size 0 is fine, Calibre updates it.
     )?;
 
     // 6. Add other metadata

@@ -178,6 +178,11 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
                 })
         });
 
+    // Get the original filename
+    let original_filename = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .context("Could not get filename from EPUB path")?;
+
     Ok(BookMetadata {
         title,
         author,
@@ -190,6 +195,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         series_index,
         publisher,
         pubdate,
+        original_filename,
     })
 }
 
