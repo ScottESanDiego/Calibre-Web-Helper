@@ -14,54 +14,95 @@ mod timestamp;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let metadata_file = cli.metadata_file.context("--metadata-file is required")?;
+    // For fix-kobo-sync command, metadata_file is not required
+    let needs_metadata = !matches!(cli.command, Commands::FixKoboSync);
+    
+    let metadata_file = if needs_metadata {
+        Some(cli.metadata_file.context("--metadata-file is required")?)
+    } else {
+        cli.metadata_file
+    };
 
-    // Validate library database file path for all commands
-    if !metadata_file.exists() {
-        anyhow::bail!(
-            "The specified library database file does not exist: {:?}",
-            metadata_file
-        );
+    // Validate library database file path for commands that need it
+    if let Some(ref metadata_file) = metadata_file {
+        if !metadata_file.exists() {
+            anyhow::bail!(
+                "The specified library database file does not exist: {:?}",
+                metadata_file
+            );
+        }
     }
 
-    let mut calibre_conn = Connection::open(&metadata_file)
-        .with_context(|| format!("Failed to open Calibre database at {:?}", metadata_file))?;
+    let mut calibre_conn = if let Some(ref metadata_file) = metadata_file {
+        Some(Connection::open(metadata_file)
+            .with_context(|| format!("Failed to open Calibre database at {:?}", metadata_file))?)
+    } else {
+        None
+    };
 
     // Add the custom title_sort function that Calibre's triggers need
-    calibre::create_calibre_functions(&calibre_conn)?;
+    if let Some(ref conn) = calibre_conn {
+        calibre::create_calibre_functions(conn)?;
+    }
 
     let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
 
     // Verify and repair any NULL timestamps in both databases
-    timestamp::verify_and_repair_timestamps(&mut calibre_conn, appdb_conn.as_mut())?;
+    if let Some(ref mut conn) = calibre_conn {
+        timestamp::verify_and_repair_timestamps(conn, appdb_conn.as_mut())?;
+    }
 
     match cli.command {
         Commands::Add { shelf, username } => {
+            let calibre_conn = calibre_conn.as_mut().context("--metadata-file is required for add command")?;
+            let metadata_file = metadata_file.as_ref().unwrap();
             if shelf.is_some() && cli.appdb_file.is_none() {
                 anyhow::bail!("--appdb-file is required when specifying a shelf");
             }
             let epub_file = cli.epub_file.context("--epub-file is required for the add command")?;
-            add_book_flow(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
+            add_book_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
         }
         Commands::List { shelf, verbose } => {
-            calibre::list_books(&calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), verbose)?;
+            let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for list command")?;
+            calibre::list_books(calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), verbose)?;
         }
         Commands::ListShelves => {
             appdb::list_shelves(appdb_conn.as_ref())?;
         }
         Commands::Delete { book_id } => {
-            calibre::delete_book(&mut calibre_conn, appdb_conn.as_ref(), &metadata_file, book_id)?;
+            let calibre_conn = calibre_conn.as_mut().context("--metadata-file is required for delete command")?;
+            let metadata_file = metadata_file.as_ref().unwrap();
+            calibre::delete_book(calibre_conn, appdb_conn.as_ref(), metadata_file, book_id)?;
         }
         Commands::CleanShelves => {
+            let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for clean-shelves command")?;
             if let Some(conn) = appdb_conn {
-                appdb::clean_empty_shelves(&conn, &calibre_conn)?;
+                appdb::clean_empty_shelves(&conn, calibre_conn)?;
             }
         }
         Commands::InspectDb => {
-            appdb::inspect_databases(appdb_conn.as_ref(), &calibre_conn)?;
+            let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for inspect-db command")?;
+            appdb::inspect_databases(appdb_conn.as_ref(), calibre_conn)?;
         }
         Commands::CleanDb => {
-            cleanup::cleanup_databases(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())?;
+            let calibre_conn = calibre_conn.as_mut().context("--metadata-file is required for clean-db command")?;
+            let metadata_file = metadata_file.as_ref().unwrap();
+            cleanup::cleanup_databases(calibre_conn, appdb_conn.as_mut(), &metadata_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())?;
+        }
+        Commands::FixKoboSync => {
+            if let Some(mut conn) = appdb_conn {
+                appdb::fix_kobo_sync_issues(&mut conn)?;
+            } else {
+                anyhow::bail!("--appdb-file is required for the fix-kobo-sync command");
+            }
+        }
+        Commands::DiagnoseKoboSync => {
+            let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for diagnose-kobo-sync command")?;
+            if let Some(conn) = appdb_conn {
+                appdb::diagnose_kobo_sync(&conn, calibre_conn)?;
+            } else {
+                anyhow::bail!("--appdb-file is required for the diagnose-kobo-sync command");
+            }
         }
     }
 

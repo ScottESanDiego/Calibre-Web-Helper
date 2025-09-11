@@ -99,6 +99,54 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
             "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added) VALUES (?1, ?2, ?3, ?4)",
             params![book_id, shelf_id, next_order, &now.format("%Y-%m-%d %H:%M:%S.%6f").to_string()]
         )?;
+
+        // Also update the shelf's last_modified timestamp
+        tx.execute(
+            "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
+            params![now.naive_local(), shelf_id],
+        )?;
+
+        // Check if this is a Kobo sync shelf and add entries to Kobo tables
+        let is_kobo_sync: bool = tx.query_row(
+            "SELECT kobo_sync FROM shelf WHERE id = ?1",
+            params![shelf_id],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if is_kobo_sync {
+            // Check if book is already in kobo_synced_books for this user
+            let already_synced: bool = tx.query_row(
+                "SELECT 1 FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
+                params![book_id, user_id],
+                |_| Ok(true)
+            ).optional()?.is_some();
+
+            if !already_synced {
+                // Add to kobo_synced_books
+                tx.execute(
+                    "INSERT INTO kobo_synced_books (user_id, book_id) VALUES (?1, ?2)",
+                    params![user_id, book_id],
+                )?;
+                println!(" -> Added book to Kobo sync list for user.");
+            }
+
+            // Check if book has a kobo_reading_state entry for this user
+            let has_reading_state: bool = tx.query_row(
+                "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+                params![book_id, user_id],
+                |_| Ok(true)
+            ).optional()?.is_some();
+
+            if !has_reading_state {
+                // Add initial reading state
+                tx.execute(
+                    "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
+                    params![user_id, book_id, now.naive_local(), now.naive_local()],
+                )?;
+                println!(" -> Created Kobo reading state for user.");
+            }
+        }
+
         println!(" -> Added book to shelf '{}'.", shelf_name);
     } else {
         println!(" -> Book is already on shelf '{}'.", shelf_name);
@@ -312,5 +360,249 @@ pub fn clean_empty_shelves(appdb_conn: &Connection, calibre_conn: &Connection) -
     }
 
     println!("✅ Shelf cleaning complete.");
+    Ok(())
+}
+
+/// Diagnoses and fixes Kobo sync issues for existing shelf links
+pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
+    println!("🔧 Diagnosing and fixing Kobo sync issues...");
+    
+    let tx = appdb_conn.transaction()?;
+    
+    // Find all books on Kobo sync shelves that aren't properly set up for sync
+    let mut stmt = tx.prepare(
+        "SELECT DISTINCT bsl.book_id, s.id as shelf_id, s.user_id, u.name as username
+         FROM book_shelf_link bsl
+         JOIN shelf s ON bsl.shelf = s.id
+         LEFT JOIN user u ON s.user_id = u.id
+         WHERE s.kobo_sync = 1"
+    )?;
+    
+    let books_on_kobo_shelves = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>("book_id")?,
+            row.get::<_, i64>("shelf_id")?,
+            row.get::<_, i64>("user_id")?,
+            row.get::<_, Option<String>>("username")?,
+        ))
+    })?;
+    
+    // Collect results before dropping the statement
+    let books_to_process: Vec<_> = books_on_kobo_shelves.collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    
+    let mut fixed_sync_entries = 0;
+    let mut fixed_reading_state = 0;
+    let mut fixed_timestamps = 0;
+    
+    for (book_id, shelf_id, user_id, username) in books_to_process {
+        let username = username.unwrap_or_else(|| "unknown".to_string());
+        
+        // Check if book is in kobo_synced_books
+        let in_sync_table: bool = tx.query_row(
+            "SELECT 1 FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |_| Ok(true)
+        ).optional()?.is_some();
+        
+        if !in_sync_table {
+            tx.execute(
+                "INSERT INTO kobo_synced_books (user_id, book_id) VALUES (?1, ?2)",
+                params![user_id, book_id],
+            )?;
+            println!(" -> Added book {} to Kobo sync list for user {}", book_id, username);
+            fixed_sync_entries += 1;
+        }
+        
+        // Check if book has reading state
+        let reading_state_id: Option<i64> = tx.query_row(
+            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |row| row.get(0)
+        ).optional()?;
+        
+        let now = chrono::Local::now().naive_local();
+        
+        if let Some(state_id) = reading_state_id {
+            // Check if timestamps need standardization
+            let current_timestamp: String = tx.query_row(
+                "SELECT last_modified FROM kobo_reading_state WHERE id = ?1",
+                params![state_id],
+                |row| row.get(0)
+            )?;
+            
+            // If timestamp doesn't have proper microsecond precision, update it
+            if !current_timestamp.contains('.') || current_timestamp.len() < 26 {
+                tx.execute(
+                    "UPDATE kobo_reading_state SET last_modified = ?1, priority_timestamp = ?2 WHERE id = ?3",
+                    params![now, now, state_id],
+                )?;
+                println!(" -> Standardized timestamps for book {} reading state", book_id);
+                fixed_timestamps += 1;
+            }
+        } else {
+            // Create new reading state
+            tx.execute(
+                "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
+                params![user_id, book_id, now, now],
+            )?;
+            println!(" -> Created Kobo reading state for book {} for user {}", book_id, username);
+            fixed_reading_state += 1;
+        }
+        
+        // Update the shelf's last_modified timestamp to trigger sync detection
+        tx.execute(
+            "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
+            params![now, shelf_id],
+        )?;
+    }
+    
+    // Also check and fix any kobo_reading_state entries that have inconsistent timestamps
+    let orphaned_states = tx.execute(
+        "UPDATE kobo_reading_state 
+         SET last_modified = priority_timestamp 
+         WHERE last_modified IS NULL AND priority_timestamp IS NOT NULL",
+        [],
+    )?;
+    
+    if orphaned_states > 0 {
+        println!(" -> Fixed {} reading states with NULL last_modified", orphaned_states);
+        fixed_timestamps += orphaned_states;
+    }
+    
+    let orphaned_priorities = tx.execute(
+        "UPDATE kobo_reading_state 
+         SET priority_timestamp = last_modified 
+         WHERE priority_timestamp IS NULL AND last_modified IS NOT NULL",
+        [],
+    )?;
+    
+    if orphaned_priorities > 0 {
+        println!(" -> Fixed {} reading states with NULL priority_timestamp", orphaned_priorities);
+        fixed_timestamps += orphaned_priorities;
+    }
+    
+    tx.commit()?;
+    
+    if fixed_sync_entries > 0 || fixed_reading_state > 0 || fixed_timestamps > 0 {
+        println!("✅ Fixed {} sync entries, {} reading states, and {} timestamps.", fixed_sync_entries, fixed_reading_state, fixed_timestamps);
+        println!("🔄 Shelf timestamps updated - try a Kobo sync now.");
+    } else {
+        println!("✅ No Kobo sync issues found.");
+    }
+    
+    Ok(())
+}
+
+/// Provides detailed diagnostics for Kobo sync setup
+pub fn diagnose_kobo_sync(appdb_conn: &Connection, calibre_conn: &Connection) -> Result<()> {
+    println!("🔍 Kobo Sync Diagnostic Report");
+    println!("═══════════════════════════════");
+    
+    // Check user Kobo settings
+    println!("\n👤 Users with Kobo sync enabled:");
+    let mut user_stmt = appdb_conn.prepare(
+        "SELECT id, name, kobo_only_shelves_sync FROM user WHERE id IN (SELECT DISTINCT user_id FROM shelf WHERE kobo_sync = 1)"
+    )?;
+    
+    let user_rows = user_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>("id")?,
+            row.get::<_, String>("name")?,
+            row.get::<_, Option<i64>>("kobo_only_shelves_sync")?,
+        ))
+    })?;
+    
+    for user_result in user_rows {
+        let (user_id, username, kobo_only) = user_result?;
+        println!("  - {} (ID: {}) - Kobo only shelves: {}", 
+                username, user_id, kobo_only.unwrap_or(0) == 1);
+    }
+    
+    // Check Kobo sync shelves
+    println!("\n📚 Kobo Sync Shelves:");
+    let mut shelf_stmt = appdb_conn.prepare(
+        "SELECT s.id, s.name, s.user_id, u.name as username, s.created, s.last_modified, 
+                COUNT(bsl.book_id) as book_count
+         FROM shelf s 
+         LEFT JOIN user u ON s.user_id = u.id
+         LEFT JOIN book_shelf_link bsl ON s.id = bsl.shelf
+         WHERE s.kobo_sync = 1 
+         GROUP BY s.id"
+    )?;
+    
+    let shelf_rows = shelf_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>("id")?,
+            row.get::<_, String>("name")?,
+            row.get::<_, String>("username")?,
+            row.get::<_, String>("created")?,
+            row.get::<_, String>("last_modified")?,
+            row.get::<_, i64>("book_count")?,
+        ))
+    })?;
+    
+    for shelf_result in shelf_rows {
+        let (shelf_id, shelf_name, username, created, last_modified, book_count) = shelf_result?;
+        println!("  - {} (ID: {}) - Owner: {} - Books: {}", shelf_name, shelf_id, username, book_count);
+        println!("    Created: {} | Last Modified: {}", created, last_modified);
+        
+        // Show books on this shelf
+        let mut book_stmt = appdb_conn.prepare(
+            "SELECT bsl.book_id, bsl.date_added, bsl.\"order\"
+             FROM book_shelf_link bsl 
+             WHERE bsl.shelf = ?1 
+             ORDER BY bsl.\"order\""
+        )?;
+        
+        let book_rows = book_stmt.query_map([shelf_id], |row| {
+            Ok((
+                row.get::<_, i64>("book_id")?,
+                row.get::<_, String>("date_added")?,
+                row.get::<_, i64>("order")?,
+            ))
+        })?;
+        
+        for book_result in book_rows {
+            let (book_id, date_added, order) = book_result?;
+            
+            // Get book title from Calibre
+            let book_title: String = calibre_conn.query_row(
+                "SELECT title FROM books WHERE id = ?1",
+                [book_id],
+                |row| row.get(0)
+            ).unwrap_or_else(|_| format!("Unknown (ID: {})", book_id));
+            
+            // Check sync status
+            let in_sync_table: bool = appdb_conn.query_row(
+                "SELECT 1 FROM kobo_synced_books WHERE book_id = ?1",
+                [book_id],
+                |_| Ok(true)
+            ).optional()?.is_some();
+            
+            let has_reading_state: bool = appdb_conn.query_row(
+                "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1",
+                [book_id],
+                |_| Ok(true)
+            ).optional()?.is_some();
+            
+            let sync_status = match (in_sync_table, has_reading_state) {
+                (true, true) => "✅ Full sync setup",
+                (true, false) => "⚠️  Missing reading state",
+                (false, true) => "⚠️  Missing sync entry",
+                (false, false) => "❌ No sync setup",
+            };
+            
+            println!("    [{}] {} - {} (Added: {})", order, book_title, sync_status, date_added);
+        }
+    }
+    
+    println!("\n💡 Troubleshooting Tips:");
+    println!("  1. Ensure the Kobo device is properly connected to Calibre-Web");
+    println!("  2. Check that the user account on Kobo matches the shelf owner");
+    println!("  3. Verify the book file exists in the Calibre library directory");
+    println!("  4. Try disconnecting and reconnecting the Kobo device");
+    println!("  5. Check Calibre-Web logs for sync errors during the sync process");
+    
     Ok(())
 }

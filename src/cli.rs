@@ -55,4 +55,8 @@ pub enum Commands {
     InspectDb,
     /// Clean up orphaned data in both databases
     CleanDb,
+    /// Fix Kobo sync issues for books on Kobo shelves
+    FixKoboSync,
+    /// Diagnose Kobo sync setup and show detailed information
+    DiagnoseKoboSync,
 }
