@@ -83,25 +83,21 @@ fn add_book_flow(
     }
 
     println!("📚 Reading EPUB metadata...");
-    let mut metadata = epub::get_epub_metadata(epub_file)?;
+    let metadata = epub::get_epub_metadata(epub_file)?;
 
-    // Normalize language to "eng" if it's an English variant
-    if let Some(lang) = &metadata.language {
-        let normalized_lang = match lang.to_lowercase().as_str() {
-            "en" | "en-us" | "en_us" | "en-gb" | "en_gb" => Some("eng".to_string()),
-            _ => None,
-        };
-        if normalized_lang.is_some() {
-            println!(" -> Normalizing language from {:?} to {:?}", metadata.language, normalized_lang);
-            metadata.language = normalized_lang;
-        }
-    }
+    // Language code was already normalized in get_epub_metadata
 
     println!(" -> Title: {}", metadata.title);
     println!(" -> Author: {}", metadata.author);
     if let Some(series) = &metadata.series {
         println!(" -> Series: {} {}", series, 
             metadata.series_index.map_or(String::new(), |idx| format!("#{}", idx)));
+    }
+    if let Some(publisher) = &metadata.publisher {
+        println!(" -> Publisher: {}", publisher);
+    }
+    if let Some(pubdate) = metadata.pubdate {
+        println!(" -> Published: {}", pubdate.format("%Y-%m-%d"));
     }
 
     println!("✒️ Writing to Calibre database...");

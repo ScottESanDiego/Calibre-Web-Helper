@@ -14,6 +14,8 @@ pub struct BookMetadata {
     pub subtitle: Option<String>,
     pub series: Option<String>,
     pub series_index: Option<f64>,
+    pub publisher: Option<String>,
+    pub pubdate: Option<DateTime<Utc>>,
 }
 
 pub enum UpsertResult {
@@ -39,11 +41,54 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         println!(" -> Found existing book with ID: {}. Updating.", book_id);
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
         
-        // Update the last_modified timestamp
+        // Get the pubdate string
+        let pubdate_str = metadata.pubdate.map(|dt| 
+            dt.format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string()
+        );
+        
+        // Update the timestamps and pubdate if provided
+        if let Some(pdate) = pubdate_str {
+            tx.execute(
+                "UPDATE books SET last_modified = ?1, pubdate = ?2 WHERE id = ?3",
+                params![&now_str, &pdate, book_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE books SET last_modified = ?1 WHERE id = ?2",
+                params![&now_str, book_id],
+            )?;
+        }
+
+        // Update publisher information
         tx.execute(
-            "UPDATE books SET last_modified = ?1 WHERE id = ?2",
-            params![&now_str, book_id],
+            "DELETE FROM books_publishers_link WHERE book = ?1",
+            params![book_id],
         )?;
+
+        if let Some(publisher_name) = &metadata.publisher {
+            // Get or create publisher entry
+            let publisher_id: i64 = match tx.query_row(
+                "SELECT id FROM publishers WHERE name = ?1",
+                params![publisher_name],
+                |row| row.get(0),
+            ) {
+                Ok(id) => id,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    tx.execute(
+                        "INSERT INTO publishers (name) VALUES (?1)",
+                        params![publisher_name],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // Link book to publisher
+            tx.execute(
+                "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
+                params![book_id, publisher_id],
+            )?;
+        }
 
         // Update series information
         if let Some(series_name) = &metadata.series {
@@ -119,7 +164,13 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
 
     // 2. Insert the book record (with a temporary path)
     // Calibre expects timestamps with microsecond precision.
-    let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
+    let now = Utc::now();
+    let now_str = now.format("%Y-%m-%d %H:%M:%S.%6f+00:00").to_string();
+    let pubdate_str = metadata.pubdate
+        .unwrap_or(now)
+        .format("%Y-%m-%d %H:%M:%S.%6f+00:00")
+        .to_string();
+        
     tx.execute(
         "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, '')",
@@ -128,7 +179,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
             &metadata.title, // Using title for sort key for simplicity
             &author_sort_name,
             &now_str,
-            &now_str,
+            &pubdate_str,
             &now_str,
         ],
     )?;
@@ -201,6 +252,32 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         tx.execute(
             "INSERT INTO identifiers (book, type, val) VALUES (?1, 'isbn', ?2)",
             params![book_id, isbn],
+        )?;
+    }
+
+    // Handle publisher information
+    if let Some(publisher_name) = &metadata.publisher {
+        // Get or create publisher entry
+        let publisher_id: i64 = match tx.query_row(
+            "SELECT id FROM publishers WHERE name = ?1",
+            params![publisher_name],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tx.execute(
+                    "INSERT INTO publishers (name) VALUES (?1)",
+                    params![publisher_name],
+                )?;
+                tx.last_insert_rowid()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Link book to publisher
+        tx.execute(
+            "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
+            params![book_id, publisher_id],
         )?;
     }
 

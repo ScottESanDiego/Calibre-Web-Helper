@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,60 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     let rights = doc.mdata("rights");
     let subtitle = doc.mdata("subtitle");
 
-    let language = doc.mdata("language");
+    // Handle language codes with proper normalization
+    let language = doc.mdata("language").map(|lang| {
+        let lang = lang.trim().to_lowercase();
+        
+        // Helper closure to normalize language codes
+        let normalize_language = |code: &str| -> String {
+            match code {
+                // Common ISO 639-1 to ISO 639-2 mappings
+                "en" => "eng".to_string(),
+                "fr" => "fre".to_string(),
+                "es" => "spa".to_string(),
+                "de" => "ger".to_string(),
+                "it" => "ita".to_string(),
+                "ja" => "jpn".to_string(),
+                "zh" => "chi".to_string(),
+                "ru" => "rus".to_string(),
+                "ar" => "ara".to_string(),
+                "hi" => "hin".to_string(),
+                "pt" => "por".to_string(),
+                "nl" => "dut".to_string(),
+                "pl" => "pol".to_string(),
+                "ko" => "kor".to_string(),
+                // Add more mappings as needed
+                _ => code.to_string(),
+            }
+        };
+
+        // Split on hyphens to handle extended tags (e.g., "en-US" -> "en")
+        let base_lang = lang.split(['-', '_']).next().unwrap_or(&lang);
+
+        // Normalize the language code
+        let normalized = if base_lang.len() == 2 {
+            normalize_language(base_lang)
+        } else if base_lang.len() == 3 {
+            // Assume it's already ISO 639-2
+            base_lang.to_string()
+        } else {
+            // Unknown format, keep as is
+            base_lang.to_string()
+        };
+
+        // Verify it's a known ISO 639-2 code and convert unknown codes to "und"
+        match normalized.as_str() {
+            "eng" | "fre" | "ger" | "spa" | "ita" | "jpn" | "chi" | "rus" | "ara" |
+            "hin" | "por" | "ben" | "urd" | "dut" | "tur" | "vie" | "tel" | "mar" |
+            "tam" | "kor" | "fra" | "deu" | "nld" | "fas" | "tha" | "pol" | "ukr" |
+            "ron" | "mal" | "hun" | "ces" | "gre" | "swe" | "bul" | "dan" | "fin" |
+            "nor" | "slo" | "cat" | "hrv" | "heb" | "lit" | "slv" | "est" |
+            "lav" | "fil" | "per" | "rum" | "cze" | "ell" | "srp" | "bel" | "kan" |
+            "alb" | "afr" | "swa" | "glg" | "mkd" | "gle" | "arm" | "lat" | "wel" |
+            "baq" | "geo" | "aze" | "kat" | "hye" | "eus" | "zho" | "yue" | "cmn" => normalized,
+            _ => "und".to_string()
+        }
+    });
 
     let isbn = doc.metadata.get("identifier").and_then(|identifiers| {
         identifiers.iter().find_map(|id| {
@@ -32,6 +86,59 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
             None
         })
     });
+
+    // Get publisher
+    let publisher = doc.mdata("publisher");
+
+    // Get publication date
+    let pubdate = doc.mdata("date")
+        .and_then(|date_str| {
+            // Try various date formats
+            let date_str = date_str.trim();
+            
+            // Try ISO8601/RFC3339 with time (YYYY-MM-DDThh:mm:ssZ)
+            if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
+                return Some(dt.with_timezone(&Utc));
+            }
+            
+            // Try ISO format (YYYY-MM-DD)
+            if let Ok(dt) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    dt.and_hms_opt(0, 0, 0).unwrap(),
+                    Utc,
+                ));
+            }
+            
+            // Try format with month name (DD MMMM YYYY)
+            if let Ok(dt) = chrono::NaiveDate::parse_from_str(date_str, "%d %B %Y")
+                .or_else(|_| chrono::NaiveDate::parse_from_str(date_str, "%d %b %Y")) {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    dt.and_hms_opt(0, 0, 0).unwrap(),
+                    Utc,
+                ));
+            }
+            
+            // Try year-month format (YYYY-MM)
+            if let Ok(dt) = chrono::NaiveDate::parse_from_str(&format!("{}-01", date_str), "%Y-%m-%d") {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    dt.and_hms_opt(0, 0, 0).unwrap(),
+                    Utc,
+                ));
+            }
+            
+            // Try year only
+            if let Ok(year) = date_str.parse::<i32>() {
+                return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    chrono::NaiveDate::from_ymd_opt(year, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                    Utc,
+                ));
+            }
+            
+            None
+        });
 
     // Extract series information from metadata
     // Look for calibre:series and calibre:series_index first
@@ -81,6 +188,8 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         subtitle,
         series,
         series_index,
+        publisher,
+        pubdate,
     })
 }
 
