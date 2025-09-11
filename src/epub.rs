@@ -186,6 +186,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     Ok(BookMetadata {
         title,
         author,
+        path: path.to_path_buf(),
         description,
         language,
         isbn,
@@ -223,7 +224,18 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
 
     // Read the metadata to get title and author for the filename
     let metadata = get_epub_metadata(epub_file)?;
-    let epub_filename = format!("{} - {}.epub", metadata.title, metadata.author);
+
+    // Validate and determine extension
+    let path_str = epub_file.to_string_lossy();
+    let extension = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
+        ".kepub"
+    } else if path_str.ends_with(".epub") {
+        ".epub"
+    } else {
+        return Err(anyhow::anyhow!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub"))
+    };
+
+    let epub_filename = format!("{} - {}{}", metadata.title, metadata.author, extension);
     let dest_file = dest_dir.join(epub_filename);
     fs::copy(epub_file, &dest_file)
         .with_context(|| format!("Failed to copy EPUB to {:?}", dest_file))?;

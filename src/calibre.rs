@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub struct BookMetadata {
     pub title: String,
     pub author: String,
+    pub path: std::path::PathBuf,
     pub description: Option<String>,
     pub language: Option<String>,
     pub isbn: Option<String>,
@@ -201,11 +202,17 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     )?;
 
     // 5. Add the file format information to the 'data' table
-    // Format filename as "Title - Author" for the database
-    let epub_name = format!("{} - {}", metadata.title, metadata.author);
-    tx.execute(
+    // Determine format based on filename
+    let path_str = metadata.path.to_string_lossy();
+    let (format, filename) = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
+        ("KEPUB", format!("{} - {}", metadata.title, metadata.author))
+    } else if path_str.ends_with(".epub") {
+        ("EPUB", format!("{} - {}", metadata.title, metadata.author))
+    } else {
+        anyhow::bail!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub")
+    };    tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-        params![book_id, "EPUB", metadata.file_size, epub_name],
+        params![book_id, format, metadata.file_size, filename],
     )?;
 
     // 6. Add other metadata

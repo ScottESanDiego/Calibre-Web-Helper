@@ -8,6 +8,8 @@ use cli::{Cli, Commands};
 mod appdb;
 mod epub;
 mod calibre;
+mod cleanup;
+mod timestamp;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -29,6 +31,9 @@ fn main() -> Result<()> {
     calibre::create_calibre_functions(&calibre_conn)?;
 
     let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
+
+    // Verify and repair any NULL timestamps in both databases
+    timestamp::verify_and_repair_timestamps(&mut calibre_conn, appdb_conn.as_mut())?;
 
     match cli.command {
         Commands::Add { shelf, username } => {
@@ -54,6 +59,9 @@ fn main() -> Result<()> {
         }
         Commands::InspectDb => {
             appdb::inspect_databases(appdb_conn.as_ref(), &calibre_conn)?;
+        }
+        Commands::CleanDb => {
+            cleanup::cleanup_databases(&mut calibre_conn, appdb_conn.as_mut(), &metadata_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())?;
         }
     }
 

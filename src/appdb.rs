@@ -65,9 +65,10 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
         Some(id) => id,
         None => {
             // Shelf doesn't exist, create it for the specific user
+            let now = chrono::Local::now().naive_local();
             tx.execute(
-                "INSERT INTO shelf (name, is_public, user_id) VALUES (?1, 0, ?2)",
-                params![shelf_name, user_id],
+                "INSERT INTO shelf (name, is_public, user_id, created, last_modified) VALUES (?1, 0, ?2, ?3, ?4)",
+                params![shelf_name, user_id, now, now],
             )?;
             println!(" -> Created new shelf '{}' for user {}.", shelf_name, 
                     username.unwrap_or("admin"));
@@ -82,9 +83,22 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
         |_| Ok(true)
     ).optional()?.is_some();
 
-    // 3. Link the book to the shelf only if it doesn't already exist
+    // 3. Get the next order value for this shelf
+    let next_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(\"order\"), 0) + 1 FROM book_shelf_link WHERE shelf = ?1",
+        params![shelf_id],
+        |row| row.get(0)
+    )?;
+
+    // 4. Link the book to the shelf only if it doesn't already exist
     if !link_exists {
-        tx.execute("INSERT INTO book_shelf_link (book_id, shelf) VALUES (?1, ?2)", params![book_id, shelf_id])?;
+        // Format current time with microsecond precision
+        let now = chrono::Local::now();
+        
+        tx.execute(
+            "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added) VALUES (?1, ?2, ?3, ?4)",
+            params![book_id, shelf_id, next_order, &now.format("%Y-%m-%d %H:%M:%S.%6f").to_string()]
+        )?;
         println!(" -> Added book to shelf '{}'.", shelf_name);
     } else {
         println!(" -> Book is already on shelf '{}'.", shelf_name);

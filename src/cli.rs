@@ -53,4 +53,6 @@ pub enum Commands {
     CleanShelves,
     /// Inspect the app.db database
     InspectDb,
+    /// Clean up orphaned data in both databases
+    CleanDb,
 }
