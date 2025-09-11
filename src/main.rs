@@ -53,17 +53,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::InspectDb => {
-            let conn = Connection::open("myfiles/app.db")?;
-            let mut stmt = conn.prepare("SELECT id, book_id, shelf FROM book_shelf_link")?;
-            let rows = stmt.query_map(params![], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-            })?;
-
-            println!("Content of book_shelf_link:");
-            for row_result in rows {
-                let (id, book_id, shelf) = row_result?;
-                println!("id: {}, book_id: {}, shelf: {}", id, book_id, shelf);
-            }
+            appdb::inspect_databases(appdb_conn.as_ref(), &calibre_conn)?;
         }
     }
 

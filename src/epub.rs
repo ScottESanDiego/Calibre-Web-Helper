@@ -183,6 +183,11 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         .map(|n| n.to_string_lossy().to_string())
         .context("Could not get filename from EPUB path")?;
 
+    // Get the file size
+    let file_size = std::fs::metadata(path)
+        .with_context(|| format!("Failed to get file size for {:?}", path))?
+        .len();
+
     Ok(BookMetadata {
         title,
         author,
@@ -196,6 +201,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         publisher,
         pubdate,
         original_filename,
+        file_size,
     })
 }
 

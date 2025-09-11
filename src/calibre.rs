@@ -17,6 +17,7 @@ pub struct BookMetadata {
     pub publisher: Option<String>,
     pub pubdate: Option<DateTime<Utc>>,
     pub original_filename: String,
+    pub file_size: u64,
 }
 
 pub enum UpsertResult {
@@ -136,7 +137,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
                 params![book_id],
             )?;
             tx.execute(
-                "UPDATE books SET series_index = NULL WHERE id = ?1",
+                "UPDATE books SET series_index = 1.0 WHERE id = ?1",
                 params![book_id],
             )?;
         }
@@ -173,8 +174,8 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         .to_string();
         
     tx.execute(
-        "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '')",
+        "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path, series_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 1.0)",
         params![
             &metadata.title,
             &metadata.title, // Using title for sort key for simplicity
@@ -203,7 +204,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     // 5. Add the file format information to the 'data' table
     tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-        params![book_id, "EPUB", 0, &metadata.original_filename], // Size 0 is fine, Calibre updates it.
+        params![book_id, "EPUB", metadata.file_size, &metadata.original_filename],
     )?;
 
     // 6. Add other metadata
@@ -377,7 +378,11 @@ pub fn list_books(
     let mut shelf_stmt = appdb_conn
         .map(|db| {
             db.prepare(
-                "SELECT s.name FROM shelf s JOIN book_shelf_link bsl ON s.id = bsl.shelf WHERE bsl.book_id = ?1",
+                "SELECT s.name, u.name as username 
+                 FROM shelf s 
+                 JOIN book_shelf_link bsl ON s.id = bsl.shelf 
+                 LEFT JOIN user u ON s.user_id = u.id 
+                 WHERE bsl.book_id = ?1",
             )
         })
         .transpose()?;
@@ -394,10 +399,19 @@ pub fn list_books(
         println!("Authors:     {}", authors.join(" & "));
 
         if let Some(stmt) = &mut shelf_stmt {
-            let shelves_iter = stmt.query_map(params![id], |row| row.get(0))?;
-            let shelves: Vec<String> = shelves_iter.collect::<Result<Vec<_>, _>>()?;
+            let shelves_iter = stmt.query_map(params![id], |row| {
+                Ok((
+                    row.get::<_, String>("name")?,
+                    row.get::<_, Option<String>>("username")?,
+                ))
+            })?;
+            let shelves: Vec<(String, Option<String>)> = shelves_iter.collect::<Result<Vec<_>, _>>()?;
             if !shelves.is_empty() {
-                println!("Shelves:     {}", shelves.join(", "));
+                println!("Shelves:");
+                for (shelf_name, username) in shelves {
+                    let user_display = username.unwrap_or_else(|| "admin".to_string());
+                    println!("            - {} (owned by {})", shelf_name, user_display);
+                }
             }
         }
 
