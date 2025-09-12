@@ -14,7 +14,7 @@ mod timestamp;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // For fix-kobo-sync command, metadata_file is not required
+    // For some commands, metadata_file is not required
     let needs_metadata = !matches!(cli.command, Commands::FixKoboSync);
     
     let metadata_file = if needs_metadata {
@@ -97,13 +97,13 @@ fn main() -> Result<()> {
             }
         }
         Commands::DiagnoseKoboSync => {
-            let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for diagnose-kobo-sync command")?;
-            if let Some(conn) = appdb_conn {
-                appdb::diagnose_kobo_sync(&conn, calibre_conn)?;
-            } else {
-                anyhow::bail!("--appdb-file is required for the diagnose-kobo-sync command");
-            }
+            let metadata_path = metadata_file.as_ref().context("metadata-file is required")?;
+            let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
+            
+            appdb::diagnose_kobo_sync(appdb_path.to_str().unwrap(), metadata_path.to_str().unwrap())
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
+
     }
 
     Ok(())

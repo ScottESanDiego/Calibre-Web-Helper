@@ -114,21 +114,9 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
         ).unwrap_or(false);
 
         if is_kobo_sync {
-            // Check if book is already in kobo_synced_books for this user
-            let already_synced: bool = tx.query_row(
-                "SELECT 1 FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
-                params![book_id, user_id],
-                |_| Ok(true)
-            ).optional()?.is_some();
-
-            if !already_synced {
-                // Add to kobo_synced_books
-                tx.execute(
-                    "INSERT INTO kobo_synced_books (user_id, book_id) VALUES (?1, ?2)",
-                    params![user_id, book_id],
-                )?;
-                println!(" -> Added book to Kobo sync list for user.");
-            }
+            // NOTE: We do NOT create kobo_synced_books entries here!
+            // Calibre-Web will create those during the actual sync process.
+            // Creating them prematurely prevents Calibre-Web from syncing the book.
 
             // Check if book has a kobo_reading_state entry for this user
             let has_reading_state: bool = tx.query_row(
@@ -144,6 +132,20 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
                     params![user_id, book_id, now.naive_local(), now.naive_local()],
                 )?;
                 println!(" -> Created Kobo reading state for user.");
+                
+                // Get the ID of the newly created reading state
+                let reading_state_id: i64 = tx.query_row(
+                    "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+                    params![book_id, user_id],
+                    |row| row.get(0)
+                )?;
+                
+                // Create corresponding kobo_statistics entry
+                tx.execute(
+                    "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
+                    params![reading_state_id, now.naive_local()],
+                )?;
+                println!(" -> Created Kobo statistics entry.");
             }
         }
 
@@ -391,27 +393,23 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     let books_to_process: Vec<_> = books_on_kobo_shelves.collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
     
-    let mut fixed_sync_entries = 0;
+    let mut cleaned_sync_entries = 0;
     let mut fixed_reading_state = 0;
     let mut fixed_timestamps = 0;
     
     for (book_id, shelf_id, user_id, username) in books_to_process {
         let username = username.unwrap_or_else(|| "unknown".to_string());
         
-        // Check if book is in kobo_synced_books
-        let in_sync_table: bool = tx.query_row(
-            "SELECT 1 FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
+        // REMOVE kobo_synced_books entries that block proper Calibre-Web sync
+        // Calibre-Web should create these during the actual sync process
+        let removed_entries = tx.execute(
+            "DELETE FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
             params![book_id, user_id],
-            |_| Ok(true)
-        ).optional()?.is_some();
+        )?;
         
-        if !in_sync_table {
-            tx.execute(
-                "INSERT INTO kobo_synced_books (user_id, book_id) VALUES (?1, ?2)",
-                params![user_id, book_id],
-            )?;
-            println!(" -> Added book {} to Kobo sync list for user {}", book_id, username);
-            fixed_sync_entries += 1;
+        if removed_entries > 0 {
+            println!(" -> Removed blocking kobo_synced_books entry for book {} (user {})", book_id, username);
+            cleaned_sync_entries += removed_entries;
         }
         
         // Check if book has reading state
@@ -481,21 +479,89 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
         println!(" -> Fixed {} reading states with NULL priority_timestamp", orphaned_priorities);
         fixed_timestamps += orphaned_priorities;
     }
+
+    if cleaned_sync_entries > 0 || fixed_reading_state > 0 || fixed_timestamps > 0 {
+        println!("✅ Cleaned {} blocking sync entries, fixed {} reading states, and {} timestamps.", cleaned_sync_entries, fixed_reading_state, fixed_timestamps);
+        println!("🔄 Books are now ready for proper Calibre-Web sync.");
+    } else {
+        println!("✅ No cleanup needed.");
+    }
     
+    // Step 3: Repair missing kobo_statistics entries
+    println!("\n📊 Repairing missing kobo_statistics entries...");
+    let mut repaired_statistics = 0;
+    
+    // Collect missing statistics in a block to release the prepared statement
+    let missing_stats = {
+        let mut stats_stmt = tx.prepare(
+            "SELECT krs.id, krs.book_id, krs.last_modified 
+             FROM kobo_reading_state krs 
+             LEFT JOIN kobo_statistics ks ON krs.id = ks.kobo_reading_state_id 
+             WHERE ks.id IS NULL"
+        )?;
+        
+        stats_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>("id")?,
+                row.get::<_, i64>("book_id")?,
+                row.get::<_, String>("last_modified")?,
+            ))
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
+    
+    for (reading_state_id, book_id, timestamp) in missing_stats {
+        tx.execute(
+            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) 
+             VALUES (?1, ?2, NULL, NULL)",
+            [reading_state_id.to_string(), timestamp],
+        )?;
+        
+        println!(" -> Created kobo_statistics entry for book {} (reading_state_id: {})", book_id, reading_state_id);
+        repaired_statistics += 1;
+    }
+    
+    // Step 4: Reset timestamps for books on Kobo shelves to ensure they sync
+    println!("\n⏰ Resetting sync timestamps to force inclusion in next sync...");
+    let mut reset_timestamps = 0;
+    
+    // Get all books on Kobo shelves and reset their timestamps to current time
+    let current_time = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S.%6f").to_string();
+    
+    let updated_books = tx.execute(
+        "UPDATE book_shelf_link 
+         SET date_added = ?1 
+         WHERE shelf IN (SELECT id FROM shelf WHERE kobo_sync = 1)",
+        [&current_time],
+    )?;
+    
+    if updated_books > 0 {
+        println!(" -> Reset timestamps for {} books on Kobo shelves to {}", updated_books, current_time);
+        reset_timestamps = updated_books;
+    }
+    
+    // Final summary
+    if repaired_statistics > 0 || reset_timestamps > 0 {
+        println!("\n✅ Additional fixes applied:");
+        if repaired_statistics > 0 {
+            println!("   - Repaired {} missing statistics entries", repaired_statistics);
+        }
+        if reset_timestamps > 0 {
+            println!("   - Reset timestamps for {} books to force sync", reset_timestamps);
+        }
+    }
+    
+    // Commit all changes
     tx.commit()?;
     
-    if fixed_sync_entries > 0 || fixed_reading_state > 0 || fixed_timestamps > 0 {
-        println!("✅ Fixed {} sync entries, {} reading states, and {} timestamps.", fixed_sync_entries, fixed_reading_state, fixed_timestamps);
-        println!("🔄 Shelf timestamps updated - try a Kobo sync now.");
-    } else {
-        println!("✅ No Kobo sync issues found.");
-    }
+    println!("\n🔄 All books on Kobo shelves are now ready for proper Calibre-Web sync!");
     
     Ok(())
 }
 
 /// Provides detailed diagnostics for Kobo sync setup
-pub fn diagnose_kobo_sync(appdb_conn: &Connection, calibre_conn: &Connection) -> Result<()> {
+pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let appdb_conn = Connection::open(appdb_path)?;
+    let calibre_conn = Connection::open(metadata_path)?;
     println!("🔍 Kobo Sync Diagnostic Report");
     println!("═══════════════════════════════");
     
@@ -606,3 +672,5 @@ pub fn diagnose_kobo_sync(appdb_conn: &Connection, calibre_conn: &Connection) ->
     
     Ok(())
 }
+
+
