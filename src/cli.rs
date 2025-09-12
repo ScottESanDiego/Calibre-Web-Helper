@@ -59,4 +59,16 @@ pub enum Commands {
     FixKoboSync,
     /// Diagnose Kobo sync setup and show detailed information
     DiagnoseKoboSync,
+    /// Add an existing book to a shelf (like Calibre-Web does)
+    AddToShelf {
+        /// The ID of the book to add to the shelf
+        #[clap(value_parser)]
+        book_id: i64,
+        /// The name of the shelf to add the book to
+        #[clap(long)]
+        shelf: String,
+        /// The username to associate the shelf with. If not provided, uses the default admin user
+        #[clap(long)]
+        username: Option<String>,
+    },
 }

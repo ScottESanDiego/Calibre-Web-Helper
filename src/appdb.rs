@@ -673,4 +673,123 @@ pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), B
     Ok(())
 }
 
+/// Adds an existing book to a shelf in the Calibre-Web database (like Calibre-Web does).
+/// This function only operates on app.db and assumes the book already exists in metadata.db.
+pub fn add_existing_book_to_shelf(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
+    let tx = conn.transaction()?;
+
+    // Get the user_id, defaulting to admin (id=1) if no username is provided
+    let user_id = if let Some(uname) = username {
+        match tx.query_row(
+            "SELECT id FROM user WHERE name = ?1",
+            params![uname],
+            |row| row.get::<_, i64>(0),
+        ).optional()? {
+            Some(id) => id,
+            None => anyhow::bail!("User '{}' not found", uname),
+        }
+    } else {
+        1 // Default admin user
+    };
+
+    // 1. Find or create the shelf
+    let shelf_id: i64 = match tx.query_row(
+        "SELECT id FROM shelf WHERE name = ?1 AND user_id = ?2",
+        params![shelf_name, user_id],
+        |row| row.get(0),
+    ).optional()? {
+        Some(id) => id,
+        None => {
+            // Shelf doesn't exist, create it for the specific user
+            let now = chrono::Local::now().naive_local();
+            tx.execute(
+                "INSERT INTO shelf (name, is_public, user_id, created, last_modified) VALUES (?1, 0, ?2, ?3, ?4)",
+                params![shelf_name, user_id, now, now],
+            )?;
+            println!(" -> Created new shelf '{}' for user {}.", shelf_name, 
+                    username.unwrap_or("admin"));
+            tx.last_insert_rowid()
+        }
+    };
+
+    // 2. Check if the link already exists to prevent duplicates
+    let link_exists: bool = tx.query_row(
+        "SELECT 1 FROM book_shelf_link WHERE book_id = ?1 AND shelf = ?2",
+        params![book_id, shelf_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+
+    if link_exists {
+        println!(" -> Book {} is already on shelf '{}'.", book_id, shelf_name);
+        tx.commit()?;
+        return Ok(());
+    }
+
+    // 3. Get the next order value for this shelf
+    let next_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(\"order\"), 0) + 1 FROM book_shelf_link WHERE shelf = ?1",
+        params![shelf_id],
+        |row| row.get(0)
+    )?;
+
+    // 4. Link the book to the shelf
+    let now = chrono::Local::now();
+    
+    tx.execute(
+        "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added) VALUES (?1, ?2, ?3, ?4)",
+        params![book_id, shelf_id, next_order, &now.format("%Y-%m-%d %H:%M:%S.%6f").to_string()]
+    )?;
+
+    // 5. Update the shelf's last_modified timestamp
+    tx.execute(
+        "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
+        params![now.naive_local(), shelf_id],
+    )?;
+
+    // 6. Handle Kobo sync if this is a Kobo shelf
+    let is_kobo_sync: bool = tx.query_row(
+        "SELECT kobo_sync FROM shelf WHERE id = ?1",
+        params![shelf_id],
+        |row| row.get(0),
+    ).unwrap_or(false);
+
+    if is_kobo_sync {
+        // Check if book has a kobo_reading_state entry for this user
+        let has_reading_state: bool = tx.query_row(
+            "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |_| Ok(true)
+        ).optional()?.is_some();
+
+        if !has_reading_state {
+            // Add initial reading state
+            tx.execute(
+                "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
+                params![user_id, book_id, now.naive_local(), now.naive_local()],
+            )?;
+            println!(" -> Created Kobo reading state for user.");
+            
+            // Get the ID of the newly created reading state
+            let reading_state_id: i64 = tx.query_row(
+                "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+                params![book_id, user_id],
+                |row| row.get(0)
+            )?;
+            
+            // Create corresponding kobo_statistics entry
+            tx.execute(
+                "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
+                params![reading_state_id, now.naive_local()],
+            )?;
+            println!(" -> Created Kobo statistics entry.");
+        }
+    }
+
+    tx.commit()?;
+    
+    println!("✅ Successfully added book {} to shelf '{}'.", book_id, shelf_name);
+
+    Ok(())
+}
+
 

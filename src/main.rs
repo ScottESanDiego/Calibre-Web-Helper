@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // For some commands, metadata_file is not required
-    let needs_metadata = !matches!(cli.command, Commands::FixKoboSync);
+    let needs_metadata = !matches!(cli.command, Commands::FixKoboSync | Commands::AddToShelf { .. });
     
     let metadata_file = if needs_metadata {
         Some(cli.metadata_file.context("--metadata-file is required")?)
@@ -101,6 +101,13 @@ fn main() -> Result<()> {
             let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
             
             appdb::diagnose_kobo_sync(appdb_path.to_str().unwrap(), metadata_path.to_str().unwrap())
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
+        Commands::AddToShelf { book_id, shelf, username } => {
+            let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
+            let mut appdb_conn = appdb::open_appdb(Some(appdb_path))?.context("Failed to open app.db")?;
+            
+            appdb::add_existing_book_to_shelf(&mut appdb_conn, book_id, &shelf, username.as_deref())
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
