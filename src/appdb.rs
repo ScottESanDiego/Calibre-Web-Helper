@@ -119,6 +119,22 @@ fn handle_kobo_sync(tx: &rusqlite::Transaction, shelf_id: i64, book_id: i64, use
                 params![reading_state_id, now_micro],
             )?;
             println!(" -> Created Kobo statistics entry.");
+            
+            // Create default bookmark for the reading state
+            tx.execute(
+                "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
+                 VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
+                params![reading_state_id, now_micro],
+            )?;
+            
+            let bookmark_id = tx.last_insert_rowid();
+            
+            // Set this as the current bookmark for the reading state
+            tx.execute(
+                "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
+                params![bookmark_id, reading_state_id],
+            )?;
+            println!(" -> Created Kobo bookmark and linked as current bookmark.");
         }
     }
     Ok(())
@@ -171,6 +187,17 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
 
     // Handle Kobo sync if needed
     handle_kobo_sync(&tx, shelf_id, book_id, user_id, &now_micro)?;
+    
+    // Clear any stale kobo_synced_books entries for this user to ensure fresh sync detection
+    // These entries are created by Calibre-Web during sync and can become stale when shelf content changes
+    let cleared_entries = tx.execute(
+        "DELETE FROM kobo_synced_books WHERE user_id = ?1",
+        params![user_id],
+    )?;
+    
+    if cleared_entries > 0 {
+        println!(" -> Cleared {} stale sync entries to ensure fresh Kobo sync detection", cleared_entries);
+    }
 
     tx.commit()?;
     Ok(true) // New link was created
@@ -581,7 +608,120 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     // Commit all changes
     tx.commit()?;
     
-    println!("\n🔄 All books on Kobo shelves are now ready for proper Calibre-Web sync!");
+    println!("\n� Checking and fixing Kobo reading state schema...");
+    fix_kobo_reading_state_schema(appdb_conn)?;
+
+    println!("\n�🔄 All books on Kobo shelves are now ready for proper Calibre-Web sync!");
+    
+    Ok(())
+}
+
+/// Fixes schema issues and data problems in kobo_reading_state and kobo_bookmark tables
+fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
+    // Check if current_bookmark column exists
+    let has_current_bookmark: bool = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kobo_reading_state'")
+        .unwrap()
+        .query_row([], |row| {
+            let sql: String = row.get(0)?;
+            Ok(sql.contains("current_bookmark"))
+        })
+        .unwrap_or(false);
+    
+    if !has_current_bookmark {
+        println!(" -> Adding missing current_bookmark column to kobo_reading_state table");
+        // First disable foreign keys, add column, then re-enable
+        conn.execute("PRAGMA foreign_keys = OFF", [])?;
+        conn.execute(
+            "ALTER TABLE kobo_reading_state ADD COLUMN current_bookmark INTEGER",
+            [],
+        )?;
+        conn.execute("PRAGMA foreign_keys = ON", [])?;
+    } else {
+        println!(" -> current_bookmark column already exists");
+    }
+    
+    // Now handle data fixes in a transaction with foreign keys disabled temporarily
+    conn.execute("PRAGMA foreign_keys = OFF", [])?;
+    let tx = conn.transaction()?;
+    
+    // Remove duplicate reading states (keep the most recent one for each book/user combination)
+    // But first, handle any bookmarks that might be orphaned
+    let duplicate_states: Vec<i64> = tx.prepare(
+        "SELECT krs.id FROM kobo_reading_state krs 
+         WHERE krs.id NOT IN (
+             SELECT MAX(id) FROM kobo_reading_state GROUP BY user_id, book_id
+         )"
+    )?.query_map([], |row| Ok(row.get::<_, i64>(0)?))
+     .unwrap()
+     .collect::<Result<Vec<_>, _>>()?;
+    
+    // Delete any bookmarks associated with duplicate reading states first
+    for state_id in &duplicate_states {
+        tx.execute(
+            "DELETE FROM kobo_bookmark WHERE kobo_reading_state_id = ?1",
+            params![state_id],
+        )?;
+    }
+    
+    // Now safely delete the duplicate reading states
+    let removed_duplicates = tx.execute(
+        "DELETE FROM kobo_reading_state WHERE id NOT IN (
+            SELECT MAX(id) FROM kobo_reading_state GROUP BY user_id, book_id
+        )",
+        [],
+    )?;
+    
+    if removed_duplicates > 0 {
+        println!(" -> Removed {} duplicate reading states", removed_duplicates);
+    }
+    
+    // Ensure all reading states have bookmarks
+    let missing_bookmarks: Vec<i64> = tx.prepare(
+        "SELECT krs.id FROM kobo_reading_state krs 
+         LEFT JOIN kobo_bookmark kb ON krs.id = kb.kobo_reading_state_id 
+         WHERE kb.id IS NULL"
+    )?.query_map([], |row| Ok(row.get::<_, i64>(0)?))
+     .unwrap()
+     .collect::<Result<Vec<_>, _>>()?;
+    
+    let current_time = now_local_micro();
+    for reading_state_id in missing_bookmarks {
+        // Create a default bookmark for reading states that don't have one
+        tx.execute(
+            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
+             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
+            params![reading_state_id, current_time],
+        )?;
+        
+        let bookmark_id = tx.last_insert_rowid();
+        
+        // Set this as the current bookmark for the reading state
+        tx.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
+            params![bookmark_id, reading_state_id],
+        )?;
+        
+        println!(" -> Created missing bookmark for reading state {}", reading_state_id);
+    }
+    
+    // Update current_bookmark references for existing reading states that have bookmarks but no current_bookmark set
+    let updated_refs = tx.execute(
+        "UPDATE kobo_reading_state SET current_bookmark = (
+            SELECT kb.id FROM kobo_bookmark kb WHERE kb.kobo_reading_state_id = kobo_reading_state.id LIMIT 1
+         ) WHERE current_bookmark IS NULL AND EXISTS (
+            SELECT 1 FROM kobo_bookmark kb WHERE kb.kobo_reading_state_id = kobo_reading_state.id
+         )",
+        [],
+    )?;
+    
+    if updated_refs > 0 {
+        println!(" -> Updated current_bookmark references for {} reading states", updated_refs);
+    }
+    
+    tx.commit()?;
+    
+    // Re-enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON", [])?;
     
     Ok(())
 }
