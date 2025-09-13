@@ -17,6 +17,10 @@ pub struct Cli {
     #[clap(long, value_parser, global = true)]
     pub epub_file: Option<PathBuf>,
 
+    /// Path to a directory containing EPUB files to add.
+    #[clap(long, value_parser, global = true)]
+    pub epub_dir: Option<PathBuf>,
+
     #[clap(subcommand)]
     pub command: Commands,
 }

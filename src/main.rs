@@ -59,8 +59,22 @@ fn main() -> Result<()> {
             if shelf.is_some() && cli.appdb_file.is_none() {
                 anyhow::bail!("--appdb-file is required when specifying a shelf");
             }
-            let epub_file = cli.epub_file.context("--epub-file is required for the add command")?;
-            add_book_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
+            
+            // Validate that exactly one of epub_file or epub_dir is provided
+            match (cli.epub_file, cli.epub_dir) {
+                (Some(epub_file), None) => {
+                    add_book_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
+                }
+                (None, Some(epub_dir)) => {
+                    add_directory_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_dir, shelf.as_deref(), username.as_deref())?;
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("Cannot specify both --epub-file and --epub-dir. Please use one or the other.");
+                }
+                (None, None) => {
+                    anyhow::bail!("Either --epub-file or --epub-dir is required for the add command");
+                }
+            }
         }
         Commands::List { shelf, verbose } => {
             let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for list command")?;
@@ -195,6 +209,94 @@ fn add_book_flow(
         metadata.title, series_msg, action_str);
 
     println!("   Please restart Calibre to see the new book.");
+
+    Ok(())
+}
+
+/// Handles the flow for adding all EPUB files in a directory.
+fn add_directory_flow(
+    calibre_conn: &mut Connection,
+    mut appdb_conn: Option<&mut Connection>,
+    library_db_path: &Path,
+    epub_dir: &Path,
+    shelf_name: Option<&str>,
+    username: Option<&str>,
+) -> Result<()> {
+    if !epub_dir.exists() {
+        anyhow::bail!("The specified directory does not exist: {:?}", epub_dir);
+    }
+    
+    if !epub_dir.is_dir() {
+        anyhow::bail!("The specified path is not a directory: {:?}", epub_dir);
+    }
+
+    println!("📁 Scanning directory for EPUB files: {:?}", epub_dir);
+    
+    // Find all EPUB files in the directory
+    let mut epub_files = Vec::new();
+    for entry in std::fs::read_dir(epub_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_file() {
+            if let Some(extension) = path.extension() {
+                let ext_str = extension.to_string_lossy().to_lowercase();
+                if ext_str == "epub" || 
+                   (ext_str == "kepub" && path.to_string_lossy().ends_with(".kepub.epub")) {
+                    epub_files.push(path);
+                }
+            }
+        }
+    }
+    
+    if epub_files.is_empty() {
+        println!("⚠️  No EPUB files found in directory: {:?}", epub_dir);
+        return Ok(());
+    }
+    
+    // Sort files for consistent processing order
+    epub_files.sort();
+    
+    println!("📚 Found {} EPUB file(s) to process:", epub_files.len());
+    for file in &epub_files {
+        println!("   - {}", file.file_name().unwrap_or_default().to_string_lossy());
+    }
+    
+    let mut successful = 0;
+    let mut failed = 0;
+    
+    println!("\n🚀 Starting batch processing...\n");
+    
+    for (index, epub_file) in epub_files.iter().enumerate() {
+        println!("📖 Processing ({}/{}) - {}", 
+                 index + 1, 
+                 epub_files.len(), 
+                 epub_file.file_name().unwrap_or_default().to_string_lossy());
+        
+        match add_book_flow(calibre_conn, appdb_conn.as_deref_mut(), library_db_path, epub_file, shelf_name, username) {
+            Ok(()) => {
+                successful += 1;
+                println!("   ✅ Success!\n");
+            }
+            Err(e) => {
+                failed += 1;
+                println!("   ❌ Failed: {}\n", e);
+                // Continue processing other files even if one fails
+            }
+        }
+    }
+    
+    // Summary
+    println!("📊 Batch processing complete:");
+    println!("   ✅ Successfully processed: {}", successful);
+    if failed > 0 {
+        println!("   ❌ Failed: {}", failed);
+    }
+    println!("   📚 Total files: {}", epub_files.len());
+    
+    if successful > 0 {
+        println!("\n   Please restart Calibre to see the new books.");
+    }
 
     Ok(())
 }
