@@ -82,64 +82,6 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
     }
 }
 
-/// Creates Kobo sync entries if the shelf has Kobo sync enabled
-fn handle_kobo_sync(tx: &rusqlite::Transaction, shelf_id: i64, book_id: i64, user_id: i64, now_micro: &str) -> Result<()> {
-    let is_kobo_sync: bool = tx.query_row(
-        "SELECT kobo_sync FROM shelf WHERE id = ?1",
-        params![shelf_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
-
-    if is_kobo_sync {
-        // Check if book has a kobo_reading_state entry for this user
-        let has_reading_state: bool = tx.query_row(
-            "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-            |_| Ok(true)
-        ).optional()?.is_some();
-
-        if !has_reading_state {
-            // Add initial reading state
-            tx.execute(
-                "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, book_id, now_micro, now_micro],
-            )?;
-            println!(" -> Created Kobo reading state for user.");
-            
-            // Get the ID of the newly created reading state
-            let reading_state_id: i64 = tx.query_row(
-                "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-                params![book_id, user_id],
-                |row| row.get(0)
-            )?;
-            
-            // Create corresponding kobo_statistics entry
-            tx.execute(
-                "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
-                params![reading_state_id, now_micro],
-            )?;
-            println!(" -> Created Kobo statistics entry.");
-            
-            // Create default bookmark for the reading state
-            tx.execute(
-                "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
-                 VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
-                params![reading_state_id, now_micro],
-            )?;
-            
-            let bookmark_id = tx.last_insert_rowid();
-            
-            // Set this as the current bookmark for the reading state
-            tx.execute(
-                "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
-                params![bookmark_id, reading_state_id],
-            )?;
-            println!(" -> Created Kobo bookmark and linked as current bookmark.");
-        }
-    }
-    Ok(())
-}
-
 /// Core function to add a book to a shelf with duplicate handling control
 fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>, allow_duplicates: bool) -> Result<bool> {
     let tx = conn.transaction()?;
@@ -185,18 +127,84 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
         params![&now_micro, shelf_id],
     )?;
 
-    // Handle Kobo sync if needed
-    handle_kobo_sync(&tx, shelf_id, book_id, user_id, &now_micro)?;
+    // Always create Kobo sync entries for books regardless of shelf sync setting
+    // This ensures books have proper sync state even if shelf sync is disabled
+    let has_reading_state: bool = tx.query_row(
+        "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+        params![book_id, user_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+
+    if !has_reading_state {
+        // Add initial reading state
+        tx.execute(
+            "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, book_id, &now_micro, &now_micro],
+        )?;
+        println!(" -> Created Kobo reading state for user.");
+        
+        // Get the ID of the newly created reading state
+        let reading_state_id: i64 = tx.query_row(
+            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |row| row.get(0)
+        )?;
+        
+        // Create corresponding kobo_statistics entry
+        tx.execute(
+            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
+            params![reading_state_id, &now_micro],
+        )?;
+        println!(" -> Created Kobo statistics entry.");
+        
+        // Create default bookmark for the reading state
+        tx.execute(
+            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
+             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
+            params![reading_state_id, &now_micro],
+        )?;
+        
+        let bookmark_id = tx.last_insert_rowid();
+        
+        // Set this as the current bookmark for the reading state
+        tx.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
+            params![bookmark_id, reading_state_id],
+        )?;
+        println!(" -> Created Kobo bookmark and linked as current bookmark.");
+    }
     
-    // Clear any stale kobo_synced_books entries for this user to ensure fresh sync detection
-    // These entries are created by Calibre-Web during sync and can become stale when shelf content changes
+    // Always ensure book_read_link exists for Kobo sync (required by Calibre-Web)
+    let has_book_read_link: bool = tx.query_row(
+        "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
+        params![book_id, user_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+
+    if !has_book_read_link {
+        tx.execute(
+            "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
+            params![book_id, user_id, &now_micro],
+        )?;
+        println!(" -> Created book read link for Kobo sync compatibility.");
+    }
+    
+    // Clear stale kobo_synced_books entries for books that are no longer on any kobo-sync shelf
+    // Only remove entries for books that aren't on any kobo-enabled shelves for this user
     let cleared_entries = tx.execute(
-        "DELETE FROM kobo_synced_books WHERE user_id = ?1",
+        "DELETE FROM kobo_synced_books 
+         WHERE user_id = ?1 
+         AND book_id NOT IN (
+            SELECT DISTINCT bsl.book_id 
+            FROM book_shelf_link bsl 
+            JOIN shelf s ON bsl.shelf = s.id 
+            WHERE s.user_id = ?1 AND s.kobo_sync = 1
+         )",
         params![user_id],
     )?;
     
     if cleared_entries > 0 {
-        println!(" -> Cleared {} stale sync entries to ensure fresh Kobo sync detection", cleared_entries);
+        println!(" -> Cleared {} stale sync entries for books no longer on kobo shelves", cleared_entries);
     }
 
     tx.commit()?;
@@ -448,24 +456,11 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     let books_to_process: Vec<_> = books_on_kobo_shelves.collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
     
-    let mut cleaned_sync_entries = 0;
     let mut fixed_reading_state = 0;
     let mut fixed_timestamps = 0;
     
     for (book_id, shelf_id, user_id, username) in books_to_process {
         let username = username.unwrap_or_else(|| "unknown".to_string());
-        
-        // REMOVE kobo_synced_books entries that block proper Calibre-Web sync
-        // Calibre-Web should create these during the actual sync process
-        let removed_entries = tx.execute(
-            "DELETE FROM kobo_synced_books WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-        )?;
-        
-        if removed_entries > 0 {
-            println!(" -> Removed blocking kobo_synced_books entry for book {} (user {})", book_id, username);
-            cleaned_sync_entries += removed_entries;
-        }
         
         // Check if book has reading state
         let reading_state_id: Option<i64> = tx.query_row(
@@ -503,6 +498,21 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
             fixed_reading_state += 1;
         }
         
+        // Ensure book_read_link exists for Kobo sync compatibility
+        let has_book_read_link: bool = tx.query_row(
+            "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |_| Ok(true)
+        ).optional()?.is_some();
+
+        if !has_book_read_link {
+            tx.execute(
+                "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
+                params![book_id, user_id, now_micro],
+            )?;
+            println!(" -> Created book read link for book {} (user {})", book_id, username);
+        }
+        
         // Update the shelf's last_modified timestamp to trigger sync detection
         tx.execute(
             "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
@@ -535,8 +545,8 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
         fixed_timestamps += orphaned_priorities;
     }
 
-    if cleaned_sync_entries > 0 || fixed_reading_state > 0 || fixed_timestamps > 0 {
-        println!("✅ Cleaned {} blocking sync entries, fixed {} reading states, and {} timestamps.", cleaned_sync_entries, fixed_reading_state, fixed_timestamps);
+    if fixed_reading_state > 0 || fixed_timestamps > 0 {
+        println!("✅ Fixed {} reading states and {} timestamps.", fixed_reading_state, fixed_timestamps);
         println!("🔄 Books are now ready for proper Calibre-Web sync.");
     } else {
         println!("✅ No cleanup needed.");
