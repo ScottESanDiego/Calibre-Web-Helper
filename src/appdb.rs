@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+use uuid::Uuid;
 
 /// Opens the app.db connection if a path is provided.
 pub fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
@@ -64,10 +65,12 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
         Some(id) => Ok(id),
         None => {
             // Shelf doesn't exist, create it for the specific user
+            // Generate UUID and set kobo_sync to match Calibre-Web behavior
+            let uuid = Uuid::new_v4().to_string();
             let now = chrono::Local::now().naive_local();
             tx.execute(
-                "INSERT INTO shelf (name, is_public, user_id, created, last_modified) VALUES (?1, 0, ?2, ?3, ?4)",
-                params![shelf_name, user_id, now, now],
+                "INSERT INTO shelf (uuid, name, is_public, user_id, kobo_sync, created, last_modified) VALUES (?1, ?2, 0, ?3, 0, ?4, ?5)",
+                params![uuid, shelf_name, user_id, now, now],
             )?;
             println!(" -> Created new shelf '{}' for user {}.", shelf_name, 
                     username.unwrap_or("admin"));
