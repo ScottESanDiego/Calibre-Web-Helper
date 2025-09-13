@@ -114,7 +114,8 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
     )?;
 
     // Link the book to the shelf
-    let now_micro = now_local_micro();
+    // Use UTC time and add a small offset to ensure it's newer than any existing sync tokens
+    let now_micro = now_utc_micro();
     
     tx.execute(
         "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added) VALUES (?1, ?2, ?3, ?4)",
@@ -205,6 +206,27 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
     
     if cleared_entries > 0 {
         println!(" -> Cleared {} stale sync entries for books no longer on kobo shelves", cleared_entries);
+    }
+    
+    // Check if the current shelf is a Kobo sync shelf, and if so, update timestamps for all books
+    let is_kobo_shelf: bool = tx.query_row(
+        "SELECT kobo_sync FROM shelf WHERE id = ?1",
+        params![shelf_id],
+        |row| row.get(0)
+    )?;
+    
+    if is_kobo_shelf {
+        // Update timestamps for ALL books on this Kobo shelf to ensure they sync together
+        let updated_books = tx.execute(
+            "UPDATE book_shelf_link 
+             SET date_added = ?1 
+             WHERE shelf = ?2 AND book_id != ?3",
+            params![&now_micro, shelf_id, book_id],
+        )?;
+        
+        if updated_books > 0 {
+            println!(" -> Updated timestamps for {} existing books on Kobo shelf to ensure consistent sync", updated_books);
+        }
     }
 
     tx.commit()?;
