@@ -147,10 +147,11 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
         }
 
         // Set both timestamps to current time if both are NULL
-        let now = chrono::Local::now().naive_local();
+        let now = chrono::Local::now();
+        let now_micro = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
         let fixed = tx.execute(
             "UPDATE shelf SET created = ?, last_modified = ? WHERE created IS NULL AND last_modified IS NULL",
-            params![now, now],
+            params![now_micro, now_micro],
         )?;
         if fixed > 0 {
             println!(" -> Fixed {} shelf records with no timestamps", fixed);
@@ -159,7 +160,7 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
         // Fix NULL timestamps in book_shelf_link
         let fixed = tx.execute(
             "UPDATE book_shelf_link SET date_added = ? WHERE date_added IS NULL",
-            params![now],
+            params![now_micro],
         )?;
         if fixed > 0 {
             println!(" -> Fixed {} book shelf links with missing timestamp", fixed);

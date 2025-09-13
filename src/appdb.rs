@@ -66,11 +66,14 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
         None => {
             // Shelf doesn't exist, create it for the specific user
             // Generate UUID and set kobo_sync to match Calibre-Web behavior
+            // Use microsecond precision like Calibre-Web
             let uuid = Uuid::new_v4().to_string();
-            let now = chrono::Local::now().naive_local();
+            let now = chrono::Local::now();
+            let now_micro = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
+            
             tx.execute(
                 "INSERT INTO shelf (uuid, name, is_public, user_id, kobo_sync, created, last_modified) VALUES (?1, ?2, 0, ?3, 0, ?4, ?5)",
-                params![uuid, shelf_name, user_id, now, now],
+                params![uuid, shelf_name, user_id, now_micro, now_micro],
             )?;
             println!(" -> Created new shelf '{}' for user {}.", shelf_name, 
                     username.unwrap_or("admin"));
@@ -97,9 +100,10 @@ fn handle_kobo_sync(tx: &rusqlite::Transaction, shelf_id: i64, book_id: i64, use
 
         if !has_reading_state {
             // Add initial reading state
+            let now_micro = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
             tx.execute(
                 "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, book_id, now.naive_local(), now.naive_local()],
+                params![user_id, book_id, now_micro, now_micro],
             )?;
             println!(" -> Created Kobo reading state for user.");
             
@@ -113,7 +117,7 @@ fn handle_kobo_sync(tx: &rusqlite::Transaction, shelf_id: i64, book_id: i64, use
             // Create corresponding kobo_statistics entry
             tx.execute(
                 "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
-                params![reading_state_id, now.naive_local()],
+                params![reading_state_id, now_micro],
             )?;
             println!(" -> Created Kobo statistics entry.");
         }
@@ -163,7 +167,7 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
     // Update the shelf's last_modified timestamp
     tx.execute(
         "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
-        params![now.naive_local(), shelf_id],
+        params![now.format("%Y-%m-%d %H:%M:%S.%6f").to_string(), shelf_id],
     )?;
 
     // Handle Kobo sync if needed
@@ -444,7 +448,8 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
             |row| row.get(0)
         ).optional()?;
         
-        let now = chrono::Local::now().naive_local();
+        let now = chrono::Local::now();
+        let now_micro = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
         
         if let Some(state_id) = reading_state_id {
             // Check if timestamps need standardization
@@ -458,7 +463,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
             if !current_timestamp.contains('.') || current_timestamp.len() < 26 {
                 tx.execute(
                     "UPDATE kobo_reading_state SET last_modified = ?1, priority_timestamp = ?2 WHERE id = ?3",
-                    params![now, now, state_id],
+                    params![now_micro, now_micro, state_id],
                 )?;
                 println!(" -> Standardized timestamps for book {} reading state", book_id);
                 fixed_timestamps += 1;
@@ -467,7 +472,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
             // Create new reading state
             tx.execute(
                 "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, book_id, now, now],
+                params![user_id, book_id, now_micro, now_micro],
             )?;
             println!(" -> Created Kobo reading state for book {} for user {}", book_id, username);
             fixed_reading_state += 1;
@@ -476,7 +481,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
         // Update the shelf's last_modified timestamp to trigger sync detection
         tx.execute(
             "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
-            params![now, shelf_id],
+            params![now_micro, shelf_id],
         )?;
     }
     
