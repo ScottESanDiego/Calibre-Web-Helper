@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use uuid::Uuid;
 use crate::utils::{now_local_micro, now_utc_micro};
@@ -82,6 +82,100 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
     }
 }
 
+/// Ensures complete Kobo sync setup for a book: reading state, statistics, bookmark, and book_read_link.
+/// This function contains the common logic shared between add_book_to_shelf_core and fix_kobo_sync_issues.
+fn ensure_kobo_sync_setup(tx: &Transaction, book_id: i64, user_id: i64, timestamp: &str) -> Result<()> {
+    // Check if reading state already exists
+    let reading_state_id: Option<i64> = tx.query_row(
+        "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+        params![book_id, user_id],
+        |row| row.get(0)
+    ).optional()?;
+    
+    let reading_state_id = if let Some(state_id) = reading_state_id {
+        state_id
+    } else {
+        // Create new reading state
+        tx.execute(
+            "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, book_id, timestamp, timestamp],
+        )?;
+        
+        // Get the ID of the newly created reading state
+        tx.query_row(
+            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
+            params![book_id, user_id],
+            |row| row.get(0)
+        )?
+    };
+    
+    // Ensure kobo_statistics entry exists
+    let has_statistics: bool = tx.query_row(
+        "SELECT 1 FROM kobo_statistics WHERE kobo_reading_state_id = ?1",
+        params![reading_state_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+    
+    if !has_statistics {
+        tx.execute(
+            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
+            params![reading_state_id, timestamp],
+        )?;
+    }
+    
+    // Ensure kobo_bookmark exists and is linked as current bookmark
+    let has_bookmark: bool = tx.query_row(
+        "SELECT 1 FROM kobo_bookmark WHERE kobo_reading_state_id = ?1",
+        params![reading_state_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+    
+    if !has_bookmark {
+        tx.execute(
+            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
+             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
+            params![reading_state_id, timestamp],
+        )?;
+        
+        let bookmark_id = tx.last_insert_rowid();
+        
+        // Set this as the current bookmark for the reading state
+        tx.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
+            params![bookmark_id, reading_state_id],
+        )?;
+    }
+    
+    // Ensure book_read_link exists for Kobo sync compatibility
+    let has_book_read_link: bool = tx.query_row(
+        "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
+        params![book_id, user_id],
+        |_| Ok(true)
+    ).optional()?.is_some();
+
+    if !has_book_read_link {
+        tx.execute(
+            "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
+            params![book_id, user_id, timestamp],
+        )?;
+    }
+    
+    Ok(())
+}
+
+/// Synchronizes timestamps for all books on Kobo shelves to ensure consistent sync behavior.
+/// This function updates all books on Kobo shelves to have the same recent timestamp.
+fn sync_kobo_shelf_timestamps(tx: &Transaction, timestamp: &str) -> Result<usize> {
+    let updated_books = tx.execute(
+        "UPDATE book_shelf_link 
+         SET date_added = ?1 
+         WHERE shelf IN (SELECT id FROM shelf WHERE kobo_sync = 1)",
+        [timestamp],
+    )?;
+    
+    Ok(updated_books)
+}
+
 /// Core function to add a book to a shelf with duplicate handling control
 fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>, allow_duplicates: bool) -> Result<bool> {
     let tx = conn.transaction()?;
@@ -128,67 +222,10 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
         params![&now_micro, shelf_id],
     )?;
 
-    // Always create Kobo sync entries for books regardless of shelf sync setting
+    // Always create complete Kobo sync setup for books regardless of shelf sync setting
     // This ensures books have proper sync state even if shelf sync is disabled
-    let has_reading_state: bool = tx.query_row(
-        "SELECT 1 FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-        params![book_id, user_id],
-        |_| Ok(true)
-    ).optional()?.is_some();
-
-    if !has_reading_state {
-        // Add initial reading state
-        tx.execute(
-            "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-            params![user_id, book_id, &now_micro, &now_micro],
-        )?;
-        println!(" -> Created Kobo reading state for user.");
-        
-        // Get the ID of the newly created reading state
-        let reading_state_id: i64 = tx.query_row(
-            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-            |row| row.get(0)
-        )?;
-        
-        // Create corresponding kobo_statistics entry
-        tx.execute(
-            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
-            params![reading_state_id, &now_micro],
-        )?;
-        println!(" -> Created Kobo statistics entry.");
-        
-        // Create default bookmark for the reading state
-        tx.execute(
-            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
-             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
-            params![reading_state_id, &now_micro],
-        )?;
-        
-        let bookmark_id = tx.last_insert_rowid();
-        
-        // Set this as the current bookmark for the reading state
-        tx.execute(
-            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
-            params![bookmark_id, reading_state_id],
-        )?;
-        println!(" -> Created Kobo bookmark and linked as current bookmark.");
-    }
-    
-    // Always ensure book_read_link exists for Kobo sync (required by Calibre-Web)
-    let has_book_read_link: bool = tx.query_row(
-        "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
-        params![book_id, user_id],
-        |_| Ok(true)
-    ).optional()?.is_some();
-
-    if !has_book_read_link {
-        tx.execute(
-            "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
-            params![book_id, user_id, &now_micro],
-        )?;
-        println!(" -> Created book read link for Kobo sync compatibility.");
-    }
+    ensure_kobo_sync_setup(&tx, book_id, user_id, &now_micro)?;
+    println!(" -> Ensured complete Kobo sync setup (reading state, statistics, bookmark, book_read_link)");
     
     // Clear stale kobo_synced_books entries for books that are no longer on any kobo-sync shelf
     // Only remove entries for books that aren't on any kobo-enabled shelves for this user
@@ -216,13 +253,8 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
     )?;
     
     if is_kobo_shelf {
-        // Update timestamps for ALL books on this Kobo shelf to ensure they sync together
-        let updated_books = tx.execute(
-            "UPDATE book_shelf_link 
-             SET date_added = ?1 
-             WHERE shelf = ?2 AND book_id != ?3",
-            params![&now_micro, shelf_id, book_id],
-        )?;
+        // Update timestamps for ALL books on Kobo shelves to ensure they sync together
+        let updated_books = sync_kobo_shelf_timestamps(&tx, &now_micro)?;
         
         if updated_books > 0 {
             println!(" -> Updated timestamps for {} existing books on Kobo shelf to ensure consistent sync", updated_books);
@@ -478,62 +510,16 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     let books_to_process: Vec<_> = books_on_kobo_shelves.collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
     
-    let mut fixed_reading_state = 0;
-    let mut fixed_timestamps = 0;
+    let book_count = books_to_process.len();
     
     for (book_id, shelf_id, user_id, username) in books_to_process {
         let username = username.unwrap_or_else(|| "unknown".to_string());
-        
-        // Check if book has reading state
-        let reading_state_id: Option<i64> = tx.query_row(
-            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-            |row| row.get(0)
-        ).optional()?;
-        
         let now_micro = now_local_micro();
         
-        if let Some(state_id) = reading_state_id {
-            // Check if timestamps need standardization
-            let current_timestamp: String = tx.query_row(
-                "SELECT last_modified FROM kobo_reading_state WHERE id = ?1",
-                params![state_id],
-                |row| row.get(0)
-            )?;
-            
-            // If timestamp doesn't have proper microsecond precision, update it
-            if !current_timestamp.contains('.') || current_timestamp.len() < 26 {
-                tx.execute(
-                    "UPDATE kobo_reading_state SET last_modified = ?1, priority_timestamp = ?2 WHERE id = ?3",
-                    params![now_micro, now_micro, state_id],
-                )?;
-                println!(" -> Standardized timestamps for book {} reading state", book_id);
-                fixed_timestamps += 1;
-            }
-        } else {
-            // Create new reading state
-            tx.execute(
-                "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-                params![user_id, book_id, now_micro, now_micro],
-            )?;
-            println!(" -> Created Kobo reading state for book {} for user {}", book_id, username);
-            fixed_reading_state += 1;
-        }
-        
-        // Ensure book_read_link exists for Kobo sync compatibility
-        let has_book_read_link: bool = tx.query_row(
-            "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-            |_| Ok(true)
-        ).optional()?.is_some();
-
-        if !has_book_read_link {
-            tx.execute(
-                "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
-                params![book_id, user_id, now_micro],
-            )?;
-            println!(" -> Created book read link for book {} (user {})", book_id, username);
-        }
+        // Use the shared function to ensure complete Kobo sync setup
+        // This handles reading state, statistics, bookmark, and book_read_link creation/verification
+        ensure_kobo_sync_setup(&tx, book_id, user_id, &now_micro)?;
+        println!(" -> Ensured complete Kobo sync setup for book {} (user {})", book_id, username);
         
         // Update the shelf's last_modified timestamp to trigger sync detection
         tx.execute(
@@ -552,7 +538,6 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     
     if orphaned_states > 0 {
         println!(" -> Fixed {} reading states with NULL last_modified", orphaned_states);
-        fixed_timestamps += orphaned_states;
     }
     
     let orphaned_priorities = tx.execute(
@@ -564,11 +549,10 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     
     if orphaned_priorities > 0 {
         println!(" -> Fixed {} reading states with NULL priority_timestamp", orphaned_priorities);
-        fixed_timestamps += orphaned_priorities;
     }
 
-    if fixed_reading_state > 0 || fixed_timestamps > 0 {
-        println!("✅ Fixed {} reading states and {} timestamps.", fixed_reading_state, fixed_timestamps);
+    if book_count > 0 || orphaned_states > 0 || orphaned_priorities > 0 {
+        println!("✅ Processed {} books and fixed {} orphaned timestamps.", book_count, orphaned_states + orphaned_priorities);
         println!("🔄 Books are now ready for proper Calibre-Web sync.");
     } else {
         println!("✅ No cleanup needed.");
@@ -609,31 +593,23 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     
     // Step 4: Reset timestamps for books on Kobo shelves to ensure they sync
     println!("\n⏰ Resetting sync timestamps to force inclusion in next sync...");
-    let mut reset_timestamps = 0;
     
     // Get all books on Kobo shelves and reset their timestamps to current time
     let current_time = now_utc_micro();
-    
-    let updated_books = tx.execute(
-        "UPDATE book_shelf_link 
-         SET date_added = ?1 
-         WHERE shelf IN (SELECT id FROM shelf WHERE kobo_sync = 1)",
-        [&current_time],
-    )?;
+    let updated_books = sync_kobo_shelf_timestamps(&tx, &current_time)?;
     
     if updated_books > 0 {
         println!(" -> Reset timestamps for {} books on Kobo shelves to {}", updated_books, current_time);
-        reset_timestamps = updated_books;
     }
     
     // Final summary
-    if repaired_statistics > 0 || reset_timestamps > 0 {
+    if repaired_statistics > 0 || updated_books > 0 {
         println!("\n✅ Additional fixes applied:");
         if repaired_statistics > 0 {
             println!("   - Repaired {} missing statistics entries", repaired_statistics);
         }
-        if reset_timestamps > 0 {
-            println!("   - Reset timestamps for {} books to force sync", reset_timestamps);
+        if updated_books > 0 {
+            println!("   - Reset timestamps for {} books to force sync", updated_books);
         }
     }
     
