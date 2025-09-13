@@ -1,9 +1,95 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use image::{ImageFormat, GenericImageView};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use crate::calibre::BookMetadata;
+
+/// Maximum cover image size in bytes (200KB)
+const MAX_COVER_SIZE: u64 = 200 * 1024;
+
+/// Resizes a cover image if it exceeds the maximum size limit.
+/// Returns the resized image data or the original data if already small enough.
+fn resize_cover_if_needed(cover_data: &[u8]) -> Result<Vec<u8>> {
+    // If the image is already small enough, return it as-is
+    if cover_data.len() as u64 <= MAX_COVER_SIZE {
+        return Ok(cover_data.to_vec());
+    }
+    
+    println!(" -> Cover image is {}KB, resizing to fit ~200KB limit...", cover_data.len() / 1024);
+    
+    // Load the image
+    let img = image::load_from_memory(cover_data)
+        .context("Failed to load cover image for resizing")?;
+    
+    // Calculate new dimensions to reduce file size
+    // Start with 80% of original dimensions and adjust if needed
+    let (original_width, original_height) = img.dimensions();
+    let mut scale_factor = 0.8;
+    
+    // Try different scale factors until we get under the size limit
+    for _attempt in 0..5 {
+        let new_width = ((original_width as f64) * scale_factor) as u32;
+        let new_height = ((original_height as f64) * scale_factor) as u32;
+        
+        // Ensure minimum dimensions
+        if new_width < 200 || new_height < 200 {
+            break;
+        }
+        
+        let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+        
+        // Encode as JPEG with high quality
+        let mut output = Vec::new();
+        let mut cursor = Cursor::new(&mut output);
+        
+        resized.write_to(&mut cursor, ImageFormat::Jpeg)
+            .context("Failed to encode resized cover image")?;
+        
+        // Check if the resized image meets our size requirement
+        if output.len() as u64 <= MAX_COVER_SIZE {
+            println!(" -> Resized cover from {}KB to {}KB ({}x{} -> {}x{})", 
+                     cover_data.len() / 1024, 
+                     output.len() / 1024,
+                     original_width, 
+                     original_height,
+                     new_width, 
+                     new_height);
+            return Ok(output);
+        }
+        
+        // Reduce scale factor for next attempt
+        scale_factor *= 0.85;
+    }
+    
+    // If we couldn't get it small enough, return the best attempt
+    let final_width = ((original_width as f64) * scale_factor) as u32;
+    let final_height = ((original_height as f64) * scale_factor) as u32;
+    
+    let resized = img.resize(
+        final_width.max(200), 
+        final_height.max(200), 
+        image::imageops::FilterType::Lanczos3
+    );
+    
+    let mut output = Vec::new();
+    let mut cursor = Cursor::new(&mut output);
+    
+    resized.write_to(&mut cursor, ImageFormat::Jpeg)
+        .context("Failed to encode final resized cover image")?;
+    
+    println!(" -> Resized cover from {}KB to {}KB ({}x{} -> {}x{})", 
+             cover_data.len() / 1024, 
+             output.len() / 1024,
+             original_width, 
+             original_height,
+             final_width.max(200), 
+             final_height.max(200));
+    
+    Ok(output)
+}
 
 /// Extracts full metadata from the EPUB file.
 pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
@@ -245,7 +331,14 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
     if let Ok(mut doc) = epub::doc::EpubDoc::new(epub_file) {
         match doc.get_cover() {
             Some((cover_data, _mime)) => {
-                std::fs::write(&cover_dest, &cover_data)
+                // Resize cover if it's too large
+                let final_cover_data = resize_cover_if_needed(&cover_data)
+                    .unwrap_or_else(|e| {
+                        println!("Warning: Failed to resize cover image: {}, using original", e);
+                        cover_data.clone()
+                    });
+                
+                std::fs::write(&cover_dest, &final_cover_data)
                     .with_context(|| format!("Failed to write cover image to {:?}", cover_dest))?;
                 println!(" -> Cover image extracted from EPUB and saved.");
                 cover_saved = true;
@@ -254,9 +347,19 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
                 // Fallback: copy external cover.jpg if it exists
                 let cover_src = epub_file.parent().map(|p| p.join("cover.jpg")).unwrap_or_else(|| PathBuf::from("cover.jpg"));
                 if cover_src.exists() {
-                    fs::copy(&cover_src, &cover_dest)
-                        .with_context(|| format!("Failed to copy cover image to {:?}", cover_dest))?;
-                    println!(" -> Cover image copied from external file.");
+                    // Read external cover and resize if needed
+                    let cover_data = fs::read(&cover_src)
+                        .with_context(|| format!("Failed to read external cover from {:?}", cover_src))?;
+                    
+                    let final_cover_data = resize_cover_if_needed(&cover_data)
+                        .unwrap_or_else(|e| {
+                            println!("Warning: Failed to resize external cover image: {}, using original", e);
+                            cover_data
+                        });
+                    
+                    std::fs::write(&cover_dest, &final_cover_data)
+                        .with_context(|| format!("Failed to write cover image to {:?}", cover_dest))?;
+                    println!(" -> Cover image copied from external file and resized if needed.");
                     cover_saved = true;
                 }
             }

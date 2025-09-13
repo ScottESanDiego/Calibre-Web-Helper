@@ -1,6 +1,6 @@
 [package]
 name = "calibre-web-helper"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["ScottESanDiego"]
 edition = "2024"
 rust-version = "1.85"  # Minimum supported Rust version (required for 2024 edition)
@@ -22,3 +22,4 @@ anyhow = "1.0.82"
 slug = "0.1.5"
 xml-rs = "0.8"
 walkdir = "2.5.0"
+image = { version = "0.24.7", default-features = false, features = ["jpeg"] }
