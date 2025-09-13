@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
+use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language};
 
 pub struct BookMetadata {
     pub title: String,
@@ -41,11 +42,11 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     if let Some((book_id, book_path)) = existing_book {
         // UPDATE PATH
         println!(" -> Found existing book with ID: {}. Updating.", book_id);
-        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S.%6f").to_string();
+        let now_str = now_utc_micro();
         
         // Get the pubdate string
         let pubdate_str = metadata.pubdate.map(|dt| 
-            dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
+            format_timestamp_micro(&dt)
         );
         
         // Update the timestamps and pubdate if provided
@@ -69,21 +70,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
 
         if let Some(publisher_name) = &metadata.publisher {
             // Get or create publisher entry
-            let publisher_id: i64 = match tx.query_row(
-                "SELECT id FROM publishers WHERE name = ?1",
-                params![publisher_name],
-                |row| row.get(0),
-            ) {
-                Ok(id) => id,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    tx.execute(
-                        "INSERT INTO publishers (name) VALUES (?1)",
-                        params![publisher_name],
-                    )?;
-                    tx.last_insert_rowid()
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
 
             // Link book to publisher
             tx.execute(
@@ -95,21 +82,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         // Update series information
         if let Some(series_name) = &metadata.series {
             // Get or create series entry
-            let series_id: i64 = match tx.query_row(
-                "SELECT id FROM series WHERE name = ?1",
-                params![series_name],
-                |row| row.get(0),
-            ) {
-                Ok(id) => id,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    tx.execute(
-                        "INSERT INTO series (name, sort) VALUES (?1, ?2)",
-                        params![series_name, series_name], // Using same value for sort
-                    )?;
-                    tx.last_insert_rowid()
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
 
             // Remove any existing series links
             tx.execute(
@@ -148,30 +121,13 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
 
     // CREATE PATH
     let author_sort_name = get_author_sort(&metadata.author);
-    let author_id: i64 = match tx.query_row(
-        "SELECT id FROM authors WHERE name = ?1",
-        params![&metadata.author],
-        |row| row.get(0),
-    ) {
-        Ok(id) => id,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            tx.execute(
-                "INSERT INTO authors (name, sort) VALUES (?1, ?2)",
-                params![&metadata.author, &author_sort_name],
-            )?;
-            tx.last_insert_rowid()
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)?;
 
     // 2. Insert the book record (with a temporary path)
     // Calibre expects timestamps with microsecond precision.
     let now = Utc::now();
-    let now_str = now.format("%Y-%m-%d %H:%M:%S.%6f").to_string();
-    let pubdate_str = metadata.pubdate
-        .unwrap_or(now)
-        .format("%Y-%m-%d %H:%M:%S.%6f")
-        .to_string();
+    let now_str = format_timestamp_micro(&now);
+    let pubdate_str = format_timestamp_micro(&metadata.pubdate.unwrap_or(now));
         
     tx.execute(
         "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path, series_index)
@@ -235,21 +191,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
         )?;
     }
     if let Some(language) = &metadata.language {
-        let lang_id: i64 = match tx.query_row(
-            "SELECT id FROM languages WHERE lang_code = ?1",
-            params![language],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.execute(
-                    "INSERT INTO languages (lang_code) VALUES (?1)",
-                    params![language],
-                )?;
-                tx.last_insert_rowid()
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let lang_id = find_or_create_language(&tx, language)?;
 
         tx.execute(
             "INSERT INTO books_languages_link (book, lang_code) VALUES (?1, ?2)",
@@ -266,21 +208,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     // Handle publisher information
     if let Some(publisher_name) = &metadata.publisher {
         // Get or create publisher entry
-        let publisher_id: i64 = match tx.query_row(
-            "SELECT id FROM publishers WHERE name = ?1",
-            params![publisher_name],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.execute(
-                    "INSERT INTO publishers (name) VALUES (?1)",
-                    params![publisher_name],
-                )?;
-                tx.last_insert_rowid()
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
 
         // Link book to publisher
         tx.execute(
@@ -292,21 +220,7 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     // Handle series information
     if let Some(series_name) = &metadata.series {
         // Get or create series entry
-        let series_id: i64 = match tx.query_row(
-            "SELECT id FROM series WHERE name = ?1",
-            params![series_name],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.execute(
-                    "INSERT INTO series (name, sort) VALUES (?1, ?2)",
-                    params![series_name, series_name], // Using same value for sort
-                )?;
-                tx.last_insert_rowid()
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
 
         // Link book to series
         tx.execute(

@@ -9,7 +9,7 @@ mod appdb;
 mod epub;
 mod calibre;
 mod cleanup;
-mod timestamp;
+mod utils;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     // Verify and repair any NULL timestamps in both databases
     if let Some(ref mut conn) = calibre_conn {
-        timestamp::verify_and_repair_timestamps(conn, appdb_conn.as_mut())?;
+        utils::verify_and_repair_timestamps(conn, appdb_conn.as_mut())?;
     }
 
     match cli.command {
