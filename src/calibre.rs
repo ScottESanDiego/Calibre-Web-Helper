@@ -49,16 +49,16 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
             format_timestamp_micro(&dt)
         );
         
-        // Update the timestamps and pubdate if provided
+        // Update the timestamps, series index, and pubdate if provided
         if let Some(pdate) = pubdate_str {
             tx.execute(
-                "UPDATE books SET last_modified = ?1, pubdate = ?2 WHERE id = ?3",
-                params![&now_str, &pdate, book_id],
+                "UPDATE books SET last_modified = ?1, pubdate = ?2, series_index = ?3 WHERE id = ?4",
+                params![&now_str, &pdate, metadata.series_index.unwrap_or(1.0), book_id],
             )?;
         } else {
             tx.execute(
-                "UPDATE books SET last_modified = ?1 WHERE id = ?2",
-                params![&now_str, book_id],
+                "UPDATE books SET last_modified = ?1, series_index = ?2 WHERE id = ?3",
+                params![&now_str, metadata.series_index.unwrap_or(1.0), book_id],
             )?;
         }
 
@@ -128,17 +128,25 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     let now = Utc::now();
     let now_str = format_timestamp_micro(&now);
     let pubdate_str = format_timestamp_micro(&metadata.pubdate.unwrap_or(now));
+    
+    // Generate a UUID for the book
+    let book_uuid = Uuid::new_v4().to_string();
+    
+    // Get proper title sort (similar to author sort)
+    let title_sort = get_title_sort(&metadata.title);
         
     tx.execute(
-        "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path, series_index)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 1.0)",
+        "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path, series_index, uuid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?8)",
         params![
             &metadata.title,
-            &metadata.title, // Using title for sort key for simplicity
+            &title_sort,
             &author_sort_name,
             &now_str,
             &pubdate_str,
             &now_str,
+            metadata.series_index.unwrap_or(1.0),
+            &book_uuid,
         ],
     )?;
     let book_id = tx.last_insert_rowid();
@@ -532,14 +540,55 @@ fn get_linked_items(
 /// Generates a sortable author name (e.g., "John Doe" -> "Doe, John").
 /// This is a simplified version of Calibre's logic.
 fn get_author_sort(author: &str) -> String {
+    let author = author.trim();
+    
+    // Handle names with prefixes like "Jr.", "Sr.", "III", etc.
     let parts: Vec<&str> = author.split_whitespace().collect();
+    
     if parts.len() > 1 {
-        let last = parts.last().unwrap_or(&"");
-        let first = &parts[..parts.len() - 1].join(" ");
-        format!("{}, {}", last, first)
+        // Check for common suffixes that should stay with the last name
+        let suffixes = ["Jr.", "Sr.", "II", "III", "IV", "Jr", "Sr"];
+        
+        let mut last_name_parts = vec![parts[parts.len() - 1]];
+        let mut first_name_end = parts.len() - 1;
+        
+        // Check if the second-to-last part is a suffix
+        if parts.len() > 2 {
+            let second_last = parts[parts.len() - 2];
+            if suffixes.iter().any(|&suffix| second_last.eq_ignore_ascii_case(suffix)) {
+                last_name_parts.insert(0, second_last);
+                first_name_end = parts.len() - 2;
+            }
+        }
+        
+        let last_name = last_name_parts.join(" ");
+        let first_name = parts[..first_name_end].join(" ");
+        
+        if first_name.is_empty() {
+            last_name
+        } else {
+            format!("{}, {}", last_name, first_name)
+        }
     } else {
         author.to_string()
     }
+}
+
+fn get_title_sort(title: &str) -> String {
+    let title = title.trim();
+    
+    // Remove common articles from the beginning for proper sorting
+    let articles = ["The ", "A ", "An "];
+    
+    for article in articles {
+        if title.len() > article.len() && title.starts_with(article) {
+            // Move article to the end
+            let rest = &title[article.len()..];
+            return format!("{}, {}", rest, article.trim());
+        }
+    }
+    
+    title.to_string()
 }
 
 /// Helper function to get the language of a book.
