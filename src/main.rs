@@ -241,8 +241,7 @@ fn add_directory_flow(
         if path.is_file() {
             if let Some(extension) = path.extension() {
                 let ext_str = extension.to_string_lossy().to_lowercase();
-                if ext_str == "epub" || 
-                   (ext_str == "kepub" && path.to_string_lossy().ends_with(".kepub.epub")) {
+                if ext_str == "epub" || ext_str == "kepub" {
                     epub_files.push(path);
                 }
             }
