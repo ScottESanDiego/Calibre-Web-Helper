@@ -111,19 +111,19 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         // Helper closure to normalize language codes
         let normalize_language = |code: &str| -> String {
             match code {
-                // Common ISO 639-1 to ISO 639-2 mappings
+                // Common ISO 639-1 to ISO 639-2 mappings (using terminological codes)
                 "en" => "eng".to_string(),
-                "fr" => "fre".to_string(),
+                "fr" => "fra".to_string(),  // French: fra (not fre)
                 "es" => "spa".to_string(),
-                "de" => "ger".to_string(),
+                "de" => "deu".to_string(),  // German: deu (not ger)
                 "it" => "ita".to_string(),
                 "ja" => "jpn".to_string(),
-                "zh" => "chi".to_string(),
+                "zh" => "zho".to_string(),  // Chinese: zho (not chi)
                 "ru" => "rus".to_string(),
                 "ar" => "ara".to_string(),
                 "hi" => "hin".to_string(),
                 "pt" => "por".to_string(),
-                "nl" => "dut".to_string(),
+                "nl" => "nld".to_string(),  // Dutch: nld (not dut)
                 "pl" => "pol".to_string(),
                 "ko" => "kor".to_string(),
                 // Add more mappings as needed
@@ -147,14 +147,14 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
 
         // Verify it's a known ISO 639-2 code and convert unknown codes to "und"
         match normalized.as_str() {
-            "eng" | "fre" | "ger" | "spa" | "ita" | "jpn" | "chi" | "rus" | "ara" |
-            "hin" | "por" | "ben" | "urd" | "dut" | "tur" | "vie" | "tel" | "mar" |
-            "tam" | "kor" | "fra" | "deu" | "nld" | "fas" | "tha" | "pol" | "ukr" |
-            "ron" | "mal" | "hun" | "ces" | "gre" | "swe" | "bul" | "dan" | "fin" |
-            "nor" | "slo" | "cat" | "hrv" | "heb" | "lit" | "slv" | "est" |
-            "lav" | "fil" | "per" | "rum" | "cze" | "ell" | "srp" | "bel" | "kan" |
-            "alb" | "afr" | "swa" | "glg" | "mkd" | "gle" | "arm" | "lat" | "wel" |
-            "baq" | "geo" | "aze" | "kat" | "hye" | "eus" | "zho" | "yue" | "cmn" => normalized,
+            "eng" | "fra" | "deu" | "spa" | "ita" | "jpn" | "zho" | "rus" | "ara" |
+            "hin" | "por" | "ben" | "urd" | "nld" | "tur" | "vie" | "tel" | "mar" |
+            "tam" | "kor" | "fas" | "tha" | "pol" | "ukr" |
+            "ron" | "mal" | "hun" | "ces" | "ell" | "swe" | "bul" | "dan" | "fin" |
+            "nor" | "slk" | "cat" | "hrv" | "heb" | "lit" | "slv" | "est" |
+            "lav" | "fil" | "mkd" | "gle" | "hye" | "lat" | "cym" |
+            "eus" | "kat" | "aze" | "swa" | "afr" | "glg" | "alb" | "bel" | "kan" |
+            "yue" | "cmn" => normalized,
             _ => "und".to_string()
         }
     });
