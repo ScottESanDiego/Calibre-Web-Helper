@@ -53,20 +53,24 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Add { shelf, username } => {
+        Commands::Add { shelf, username, dry_run } => {
             let calibre_conn = calibre_conn.as_mut().context("--metadata-file is required for add command")?;
             let metadata_file = metadata_file.as_ref().unwrap();
             if shelf.is_some() && cli.appdb_file.is_none() {
                 anyhow::bail!("--appdb-file is required when specifying a shelf");
             }
             
+            if dry_run {
+                println!("🧪 DRY RUN MODE: No changes will be made to databases or files\n");
+            }
+            
             // Validate that exactly one of epub_file or epub_dir is provided
             match (cli.epub_file, cli.epub_dir) {
                 (Some(epub_file), None) => {
-                    add_book_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_file, shelf.as_deref(), username.as_deref())?;
+                    add_book_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_file, shelf.as_deref(), username.as_deref(), dry_run)?;
                 }
                 (None, Some(epub_dir)) => {
-                    add_directory_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_dir, shelf.as_deref(), username.as_deref())?;
+                    add_directory_flow(calibre_conn, appdb_conn.as_mut(), metadata_file, &epub_dir, shelf.as_deref(), username.as_deref(), dry_run)?;
                 }
                 (Some(_), Some(_)) => {
                     anyhow::bail!("Cannot specify both --epub-file and --epub-dir. Please use one or the other.");
@@ -138,6 +142,7 @@ fn add_book_flow(
     epub_file: &Path,
     shelf_name: Option<&str>,
     username: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
     if !epub_file.exists() {
         anyhow::bail!("The specified EPUB file does not exist.");
@@ -163,7 +168,7 @@ fn add_book_flow(
 
     println!("✒️ Writing to Calibre database...");
     let library_dir = library_db_path.parent().unwrap_or_else(|| Path::new("."));
-    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir, epub_file)?;
+    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir, epub_file, dry_run)?;
 
     let (book_id, book_path, is_update, skip_file_operations) = match upsert_result {
         calibre::UpsertResult::Created { book_id, book_path } => {
@@ -191,10 +196,15 @@ fn add_book_flow(
 
     // Clap's `requires` attribute ensures appdb_conn is Some if shelf_name is Some.
     if let (Some(name), Some(conn)) = (shelf_name, appdb_conn) {
-        appdb::add_book_to_shelf_in_appdb(conn, book_id, name, username)?;
+        if dry_run {
+            println!("📚 Would add book to shelf '{}'", name);
+            println!("   [DRY RUN] Would update app.db with shelf assignment");
+        } else {
+            appdb::add_book_to_shelf_in_appdb(conn, book_id, name, username)?;
+        }
     }
 
-    if !skip_file_operations {
+    if !skip_file_operations && !dry_run {
         println!("🚚 Updating files in library...");
         let cover_saved = epub::update_book_files(library_db_path.parent().unwrap_or_else(|| Path::new(".")), epub_file, &book_path, is_update)?;
         println!(" -> File copied successfully.");
@@ -203,11 +213,27 @@ fn add_book_flow(
             calibre_conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", params![book_id])?;
             println!(" -> Updated database to reflect cover image.");
         }
+    } else if !skip_file_operations && dry_run {
+        println!("� Would update files in library...");
+        println!("   [DRY RUN] Would copy EPUB file to: {}", book_path);
+        println!("   [DRY RUN] Would extract and resize cover image");
     } else {
-        println!("📁 Skipping file operations (no changes needed).");
+        if dry_run {
+            println!("📁 Would skip file operations (no changes needed).");
+        } else {
+            println!("�📁 Skipping file operations (no changes needed).");
+        }
     }
 
-    let action_str = if skip_file_operations {
+    let action_str = if dry_run {
+        if skip_file_operations {
+            "would be already up to date in"
+        } else if is_update {
+            "would be updated in"
+        } else {
+            "would be added to"
+        }
+    } else if skip_file_operations {
         "already up to date in"
     } else if is_update {
         "updated in"
@@ -222,12 +248,15 @@ fn add_book_flow(
         String::new()
     };
 
+    let success_icon = if dry_run { "🧪" } else { "✅" };
     println!("
-✅ Success! '{}'{} has been {} your Calibre library.",
-        metadata.title, series_msg, action_str);
+{} Success! '{}'{} has been {} your Calibre library.",
+        success_icon, metadata.title, series_msg, action_str);
 
-    if !skip_file_operations {
+    if !skip_file_operations && !dry_run {
         println!("   Please restart Calibre to see the new book.");
+    } else if dry_run {
+        println!("   [DRY RUN] No actual changes were made.");
     }
 
     Ok(())
@@ -241,6 +270,7 @@ fn add_directory_flow(
     epub_dir: &Path,
     shelf_name: Option<&str>,
     username: Option<&str>,
+    dry_run: bool,
 ) -> Result<()> {
     if !epub_dir.exists() {
         anyhow::bail!("The specified directory does not exist: {:?}", epub_dir);
@@ -292,7 +322,7 @@ fn add_directory_flow(
                  epub_files.len(), 
                  epub_file.file_name().unwrap_or_default().to_string_lossy());
         
-        match add_book_flow(calibre_conn, appdb_conn.as_deref_mut(), library_db_path, epub_file, shelf_name, username) {
+        match add_book_flow(calibre_conn, appdb_conn.as_deref_mut(), library_db_path, epub_file, shelf_name, username, dry_run) {
             Ok(()) => {
                 successful += 1;
                 println!("   ✅ Success!\n");

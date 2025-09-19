@@ -35,6 +35,9 @@ pub enum Commands {
         /// The username to associate the shelf with. If not provided, uses the default admin user.
         #[clap(long, help = "The username to associate the shelf with. If not provided, uses the default admin user.")]
         username: Option<String>,
+        /// Show what would be done without making any changes
+        #[clap(long)]
+        dry_run: bool,
     },
     /// List all books in the library with their attributes
     List {

@@ -24,8 +24,6 @@ pub struct BookMetadata {
 
 #[derive(Debug)]
 struct ExistingBookData {
-    pub id: i64,
-    pub path: String,
     pub pubdate: Option<DateTime<Utc>>,
     pub series_index: f64,
     pub publisher: Option<String>,
@@ -35,10 +33,10 @@ struct ExistingBookData {
 /// Retrieves existing book metadata for comparison
 fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookData> {
     // Get basic book data
-    let (path, pubdate_str, series_index): (String, Option<String>, f64) = tx.query_row(
-        "SELECT path, pubdate, series_index FROM books WHERE id = ?1",
+    let (pubdate_str, series_index): (Option<String>, f64) = tx.query_row(
+        "SELECT pubdate, series_index FROM books WHERE id = ?1",
         params![book_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        |row| Ok((row.get(1)?, row.get(2)?))
     )?;
     
     // Parse pubdate if it exists
@@ -73,8 +71,6 @@ fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookD
     ).optional()?;
     
     Ok(ExistingBookData {
-        id: book_id,
-        path,
         pubdate,
         series_index,
         publisher,
@@ -158,7 +154,8 @@ pub fn add_book_to_db(
     conn: &mut Connection, 
     metadata: &BookMetadata, 
     library_dir: &Path, 
-    new_epub_file: &Path
+    new_epub_file: &Path,
+    dry_run: bool
 ) -> Result<UpsertResult> {
     let tx = conn.transaction()?;
 
@@ -182,10 +179,17 @@ pub fn add_book_to_db(
             if let Ok(existing_file_hash) = calculate_file_hash(&existing_file_path) {
                 if new_file_hash == existing_file_hash {
                     println!(" -> Files are identical (same hash). No changes needed.");
+                    if dry_run {
+                        println!("   [DRY RUN] Would skip all operations");
+                    }
                     tx.commit()?;
                     return Ok(UpsertResult::NoChanges { book_id, book_path });
                 } else {
-                    println!(" -> Files differ (different hash). Checking metadata changes...");
+                    if dry_run {
+                        println!(" -> Files differ (different hash). Would check metadata changes...");
+                    } else {
+                        println!(" -> Files differ (different hash). Checking metadata changes...");
+                    }
                 }
             } else {
                 println!(" -> Could not hash existing file. Proceeding with metadata comparison...");
@@ -199,9 +203,23 @@ pub fn add_book_to_db(
         let changes = determine_changes(&existing_data, metadata);
         
         if !changes.has_any_changes() {
-            println!(" -> No metadata changes detected. Skipping database update.");
+            if dry_run {
+                println!(" -> No metadata changes detected. Would skip database update.");
+                println!("   [DRY RUN] Would skip all operations");
+            } else {
+                println!(" -> No metadata changes detected. Skipping database update.");
+            }
             tx.commit()?;
             return Ok(UpsertResult::NoChanges { book_id, book_path });
+        }
+        
+        if dry_run {
+            println!(" -> Metadata changes detected. Would update database...");
+            println!("   [DRY RUN] Would update: pubdate={}, series_index={}, publisher={}, series={}", 
+                changes.pubdate_changed, changes.series_index_changed, 
+                changes.publisher_changed, changes.series_changed);
+            tx.commit()?;
+            return Ok(UpsertResult::Updated { book_id, book_path });
         }
         
         println!(" -> Metadata changes detected. Updating database...");
@@ -280,6 +298,21 @@ pub fn add_book_to_db(
     }
 
     // CREATE PATH
+    if dry_run {
+        println!(" -> Would create new book with title: '{}'", metadata.title);
+        println!(" -> Would assign author: '{}'", metadata.author);
+        if let Some(publisher) = &metadata.publisher {
+            println!(" -> Would set publisher: '{}'", publisher);
+        }
+        if let Some(series) = &metadata.series {
+            println!(" -> Would add to series: '{}'", series);
+        }
+        println!("   [DRY RUN] Would create new database entry and copy files");
+        tx.commit()?;
+        // Return a fake book_id and path for dry-run
+        return Ok(UpsertResult::Created { book_id: 0, book_path: format!("{}/{} (NEW)", metadata.author, metadata.title) });
+    }
+    
     let author_sort_name = get_author_sort(&metadata.author);
     let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)?;
 
