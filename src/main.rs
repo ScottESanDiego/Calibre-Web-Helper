@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // For some commands, metadata_file is not required
-    let needs_metadata = !matches!(cli.command, Commands::FixKoboSync | Commands::AddToShelf { .. });
+    let needs_metadata = !matches!(cli.command, Commands::FixKoboSync | Commands::AddToShelf { .. } | Commands::ListShelves);
     
     let metadata_file = if needs_metadata {
         Some(cli.metadata_file.context("--metadata-file is required")?)
@@ -76,9 +76,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::List { shelf, verbose } => {
+        Commands::List { shelf, unshelved, verbose } => {
             let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for list command")?;
-            calibre::list_books(calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), verbose)?;
+            calibre::list_books(calibre_conn, appdb_conn.as_ref(), shelf.as_deref(), unshelved, verbose)?;
         }
         Commands::ListShelves => {
             appdb::list_shelves(appdb_conn.as_ref())?;
@@ -162,22 +162,30 @@ fn add_book_flow(
     }
 
     println!("✒️ Writing to Calibre database...");
-    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata)?;
+    let library_dir = library_db_path.parent().unwrap_or_else(|| Path::new("."));
+    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir, epub_file)?;
 
-    let (book_id, book_path, is_update) = match upsert_result {
+    let (book_id, book_path, is_update, skip_file_operations) = match upsert_result {
         calibre::UpsertResult::Created { book_id, book_path } => {
             println!(
                 " -> Successfully created database entry with Book ID: {}",
                 book_id
             );
-            (book_id, book_path, false)
+            (book_id, book_path, false, false)
         }
         calibre::UpsertResult::Updated { book_id, book_path } => {
             println!(
                 " -> Successfully updated database entry for Book ID: {}",
                 book_id
             );
-            (book_id, book_path, true)
+            (book_id, book_path, true, false)
+        }
+        calibre::UpsertResult::NoChanges { book_id, book_path } => {
+            println!(
+                " -> No changes needed for Book ID: {}",
+                book_id
+            );
+            (book_id, book_path, true, true)
         }
     };
 
@@ -186,16 +194,26 @@ fn add_book_flow(
         appdb::add_book_to_shelf_in_appdb(conn, book_id, name, username)?;
     }
 
-    println!("🚚 Updating files in library...");
-    let cover_saved = epub::update_book_files(library_db_path.parent().unwrap_or_else(|| Path::new(".")), epub_file, &book_path, is_update)?;
-    println!(" -> File copied successfully.");
+    if !skip_file_operations {
+        println!("🚚 Updating files in library...");
+        let cover_saved = epub::update_book_files(library_db_path.parent().unwrap_or_else(|| Path::new(".")), epub_file, &book_path, is_update)?;
+        println!(" -> File copied successfully.");
 
-    if cover_saved {
-        calibre_conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", params![book_id])?;
-        println!(" -> Updated database to reflect cover image.");
+        if cover_saved {
+            calibre_conn.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", params![book_id])?;
+            println!(" -> Updated database to reflect cover image.");
+        }
+    } else {
+        println!("📁 Skipping file operations (no changes needed).");
     }
 
-    let action_str = if is_update { "updated in" } else { "added to" };
+    let action_str = if skip_file_operations {
+        "already up to date in"
+    } else if is_update {
+        "updated in"
+    } else {
+        "added to"
+    };
     // Check series status for feedback message
     let series_msg = if let Some(series) = &metadata.series {
         format!(" (part of series '{}'{})'", series,
@@ -208,7 +226,9 @@ fn add_book_flow(
 ✅ Success! '{}'{} has been {} your Calibre library.",
         metadata.title, series_msg, action_str);
 
-    println!("   Please restart Calibre to see the new book.");
+    if !skip_file_operations {
+        println!("   Please restart Calibre to see the new book.");
+    }
 
     Ok(())
 }

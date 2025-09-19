@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
-use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language};
+use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash};
 
 pub struct BookMetadata {
     pub title: String,
@@ -21,14 +22,144 @@ pub struct BookMetadata {
     pub file_size: u64,
 }
 
+#[derive(Debug)]
+struct ExistingBookData {
+    pub id: i64,
+    pub path: String,
+    pub pubdate: Option<DateTime<Utc>>,
+    pub series_index: f64,
+    pub publisher: Option<String>,
+    pub series: Option<String>,
+}
+
+/// Retrieves existing book metadata for comparison
+fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookData> {
+    // Get basic book data
+    let (path, pubdate_str, series_index): (String, Option<String>, f64) = tx.query_row(
+        "SELECT path, pubdate, series_index FROM books WHERE id = ?1",
+        params![book_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    )?;
+    
+    // Parse pubdate if it exists
+    let pubdate = pubdate_str.and_then(|s| {
+        // Try parsing with timezone first
+        if let Ok(dt) = DateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.6f%z") {
+            Some(dt.with_timezone(&Utc))
+        } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.6f") {
+            // If that fails, try parsing as naive datetime and assume UTC
+            Some(DateTime::from_naive_utc_and_offset(naive, Utc))
+        } else {
+            None
+        }
+    });
+    
+    // Get publisher name
+    let publisher: Option<String> = tx.query_row(
+        "SELECT p.name FROM publishers p 
+         JOIN books_publishers_link bpl ON p.id = bpl.publisher 
+         WHERE bpl.book = ?1",
+        params![book_id],
+        |row| row.get(0)
+    ).optional()?;
+    
+    // Get series name
+    let series: Option<String> = tx.query_row(
+        "SELECT s.name FROM series s 
+         JOIN books_series_link bsl ON s.id = bsl.series 
+         WHERE bsl.book = ?1",
+        params![book_id],
+        |row| row.get(0)
+    ).optional()?;
+    
+    Ok(ExistingBookData {
+        id: book_id,
+        path,
+        pubdate,
+        series_index,
+        publisher,
+        series,
+    })
+}
+
+/// Get the file path of an existing book in the library
+fn get_existing_book_file_path(library_dir: &Path, book_path: &str, _book_id: i64) -> Result<Option<std::path::PathBuf>> {
+    let book_dir = library_dir.join(book_path);
+    if !book_dir.exists() {
+        return Ok(None);
+    }
+    
+    // Look for EPUB or KEPUB files in the book directory
+    for entry in std::fs::read_dir(&book_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let path_str = path.to_string_lossy().to_lowercase();
+            if path_str.ends_with(".epub") || path_str.ends_with(".kepub") {
+                return Ok(Some(path));
+            }
+        }
+    }
+    
+    Ok(None)
+}
+
+/// Compares new metadata with existing book data to determine what needs updating
+fn determine_changes(existing: &ExistingBookData, new_metadata: &BookMetadata) -> UpdateChanges {
+    let mut changes = UpdateChanges::default();
+    
+    // Compare pubdate
+    if existing.pubdate != new_metadata.pubdate {
+        changes.pubdate_changed = true;
+    }
+    
+    // Compare series_index
+    let new_series_index = new_metadata.series_index.unwrap_or(1.0);
+    if (existing.series_index - new_series_index).abs() > f64::EPSILON {
+        changes.series_index_changed = true;
+    }
+    
+    // Compare publisher
+    if existing.publisher != new_metadata.publisher {
+        changes.publisher_changed = true;
+    }
+    
+    // Compare series
+    if existing.series != new_metadata.series {
+        changes.series_changed = true;
+    }
+    
+    changes
+}
+
+#[derive(Debug, Default)]
+struct UpdateChanges {
+    pubdate_changed: bool,
+    series_index_changed: bool,
+    publisher_changed: bool,
+    series_changed: bool,
+}
+
+impl UpdateChanges {
+    fn has_any_changes(&self) -> bool {
+        self.pubdate_changed || self.series_index_changed || self.publisher_changed || self.series_changed
+    }
+}
+
 pub enum UpsertResult {
     Created { book_id: i64, book_path: String },
     Updated { book_id: i64, book_path: String },
+    NoChanges { book_id: i64, book_path: String },
 }
 
 /// Handles the entire database transaction for adding a new book.
 /// If a book with the same title and author exists, it updates it. Otherwise, it creates a new one.
-pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<UpsertResult> {
+pub fn add_book_to_db(
+    conn: &mut Connection, 
+    metadata: &BookMetadata, 
+    library_dir: &Path, 
+    new_epub_file: &Path
+) -> Result<UpsertResult> {
     let tx = conn.transaction()?;
 
     // Check for an existing book by title and author sort key.
@@ -40,79 +171,108 @@ pub fn add_book_to_db(conn: &mut Connection, metadata: &BookMetadata) -> Result<
     ).optional()?;
 
     if let Some((book_id, book_path)) = existing_book {
-        // UPDATE PATH
-        println!(" -> Found existing book with ID: {}. Updating.", book_id);
+        // UPDATE PATH - Fast-path: Check if files are identical using hash comparison
+        println!(" -> Found existing book with ID: {}. Checking file hash...", book_id);
+        
+        // Calculate hash of the new EPUB file
+        let new_file_hash = calculate_file_hash(new_epub_file)?;
+        
+        // Try to find and hash the existing file
+        if let Some(existing_file_path) = get_existing_book_file_path(library_dir, &book_path, book_id)? {
+            if let Ok(existing_file_hash) = calculate_file_hash(&existing_file_path) {
+                if new_file_hash == existing_file_hash {
+                    println!(" -> Files are identical (same hash). No changes needed.");
+                    tx.commit()?;
+                    return Ok(UpsertResult::NoChanges { book_id, book_path });
+                } else {
+                    println!(" -> Files differ (different hash). Checking metadata changes...");
+                }
+            } else {
+                println!(" -> Could not hash existing file. Proceeding with metadata comparison...");
+            }
+        } else {
+            println!(" -> Existing file not found. Proceeding with update...");
+        }
+        
+        // Get existing book data for comparison
+        let existing_data = get_existing_book_data(&tx, book_id)?;
+        let changes = determine_changes(&existing_data, metadata);
+        
+        if !changes.has_any_changes() {
+            println!(" -> No metadata changes detected. Skipping database update.");
+            tx.commit()?;
+            return Ok(UpsertResult::NoChanges { book_id, book_path });
+        }
+        
+        println!(" -> Metadata changes detected. Updating database...");
         let now_str = now_utc_micro();
         
-        // Get the pubdate string
-        let pubdate_str = metadata.pubdate.map(|dt| 
-            format_timestamp_micro(&dt)
-        );
-        
-        // Update the timestamps, series index, and pubdate if provided
-        if let Some(pdate) = pubdate_str {
-            tx.execute(
-                "UPDATE books SET last_modified = ?1, pubdate = ?2, series_index = ?3 WHERE id = ?4",
-                params![&now_str, &pdate, metadata.series_index.unwrap_or(1.0), book_id],
-            )?;
-        } else {
+        // Always update last_modified when changes are detected
+        // Update other fields only if they changed
+        if changes.pubdate_changed && changes.series_index_changed {
+            if let Some(pubdate) = metadata.pubdate {
+                let pubdate_str = format_timestamp_micro(&pubdate);
+                tx.execute(
+                    "UPDATE books SET last_modified = ?1, pubdate = ?2, series_index = ?3 WHERE id = ?4",
+                    params![&now_str, &pubdate_str, metadata.series_index.unwrap_or(1.0), book_id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE books SET last_modified = ?1, series_index = ?2 WHERE id = ?3",
+                    params![&now_str, metadata.series_index.unwrap_or(1.0), book_id],
+                )?;
+            }
+        } else if changes.pubdate_changed {
+            if let Some(pubdate) = metadata.pubdate {
+                let pubdate_str = format_timestamp_micro(&pubdate);
+                tx.execute(
+                    "UPDATE books SET last_modified = ?1, pubdate = ?2 WHERE id = ?3",
+                    params![&now_str, &pubdate_str, book_id],
+                )?;
+            }
+        } else if changes.series_index_changed {
             tx.execute(
                 "UPDATE books SET last_modified = ?1, series_index = ?2 WHERE id = ?3",
                 params![&now_str, metadata.series_index.unwrap_or(1.0), book_id],
             )?;
-        }
-
-        // Update publisher information
-        tx.execute(
-            "DELETE FROM books_publishers_link WHERE book = ?1",
-            params![book_id],
-        )?;
-
-        if let Some(publisher_name) = &metadata.publisher {
-            // Get or create publisher entry
-            let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
-
-            // Link book to publisher
+        } else {
+            // Only last_modified needs updating
             tx.execute(
-                "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
-                params![book_id, publisher_id],
+                "UPDATE books SET last_modified = ?1 WHERE id = ?2",
+                params![&now_str, book_id],
             )?;
         }
 
-        // Update series information
-        if let Some(series_name) = &metadata.series {
-            // Get or create series entry
-            let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
-
-            // Remove any existing series links
+        // Update publisher information only if changed
+        if changes.publisher_changed {
             tx.execute(
-                "DELETE FROM books_series_link WHERE book = ?1",
+                "DELETE FROM books_publishers_link WHERE book = ?1",
                 params![book_id],
             )?;
 
-            // Link book to series
-            tx.execute(
-                "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
-                params![book_id, series_id],
-            )?;
-
-            // Set series index in books table
-            if let Some(index) = metadata.series_index {
+            if let Some(publisher_name) = &metadata.publisher {
+                let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
                 tx.execute(
-                    "UPDATE books SET series_index = ?1 WHERE id = ?2",
-                    params![index, book_id],
+                    "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
+                    params![book_id, publisher_id],
                 )?;
             }
-        } else {
-            // If no series info provided, remove any existing series information
+        }
+
+        // Update series information only if changed
+        if changes.series_changed {
             tx.execute(
                 "DELETE FROM books_series_link WHERE book = ?1",
                 params![book_id],
             )?;
-            tx.execute(
-                "UPDATE books SET series_index = 1.0 WHERE id = ?1",
-                params![book_id],
-            )?;
+
+            if let Some(series_name) = &metadata.series {
+                let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
+                tx.execute(
+                    "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
+                    params![book_id, series_id],
+                )?;
+            }
         }
 
         tx.commit()?;
@@ -256,9 +416,35 @@ pub fn list_books(
     conn: &Connection,
     appdb_conn: Option<&Connection>,
     shelf_name: Option<&str>,
+    unshelved: bool,
     verbose: bool,
 ) -> Result<()> {
-    let book_ids_on_shelf = if let Some(shelf) = shelf_name {
+    let book_ids_on_shelf = if unshelved {
+        // Find books NOT on any shelf
+        let appdb = appdb_conn.context("app.db connection is required to find unshelved books")?;
+        
+        // First get all book IDs from metadata.db
+        let mut all_books_stmt = conn.prepare("SELECT id FROM books")?;
+        let all_book_ids: Vec<i64> = all_books_stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        
+        // Then get book IDs that ARE on shelves from app.db
+        let mut shelved_stmt = appdb.prepare("SELECT DISTINCT book_id FROM book_shelf_link")?;
+        let shelved_ids: HashSet<i64> = shelved_stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?
+            .into_iter().collect();
+        
+        // Find books that are NOT on any shelf
+        let unshelved_ids: Vec<i64> = all_book_ids.into_iter()
+            .filter(|id| !shelved_ids.contains(id))
+            .collect();
+
+        if unshelved_ids.is_empty() {
+            println!("No unshelved books found. All books are on at least one shelf.");
+            return Ok(());
+        }
+        Some(unshelved_ids)
+    } else if let Some(shelf) = shelf_name {
         let appdb = appdb_conn.context("app.db connection is required to filter by shelf")?;
         let mut stmt = appdb.prepare(
             "SELECT bsl.book_id FROM book_shelf_link bsl
@@ -297,12 +483,12 @@ pub fn list_books(
 
     let mut rows = stmt.query(&params_vec[..])?;
 
-    if let Some(shelf) = shelf_name {
-        println!("📚 Listing books on shelf '{}'...
-", shelf);
+    if unshelved {
+        println!("📚 Listing books not on any shelf...\n");
+    } else if let Some(shelf) = shelf_name {
+        println!("📚 Listing books on shelf '{}'...\n", shelf);
     } else {
-        println!("📚 Listing all books in the library...
-");
+        println!("📚 Listing all books in the library...\n");
     }
 
     let mut shelf_stmt = appdb_conn
@@ -340,7 +526,7 @@ pub fn list_books(
                 println!("Shelves:");
                 for (shelf_name, username) in shelves {
                     let user_display = username.unwrap_or_else(|| "admin".to_string());
-                    println!("            - {} (owned by {})", shelf_name, user_display);
+                    println!("            - {} (User: {})", shelf_name, user_display);
                 }
             }
         }

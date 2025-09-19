@@ -1,6 +1,9 @@
 use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::{params, Transaction, Error as SqliteError, Connection};
 use anyhow::Result;
+use sha1::{Sha1, Digest};
+use std::fs::File;
+use std::io::Read;
 
 /// Format a timestamp with microsecond precision for database storage
 /// This matches the format used by both Calibre and Calibre-Web
@@ -216,4 +219,21 @@ pub fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: O
     }
 
     Ok(())
+}
+
+/// Calculate SHA1 hash of a file
+pub fn calculate_file_hash(file_path: &std::path::Path) -> Result<String> {
+    let mut file = File::open(file_path)?;
+    let mut hasher = Sha1::new();
+    let mut buffer = [0; 8192]; // 8KB buffer for reading chunks
+    
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    
+    Ok(format!("{:x}", hasher.finalize()))
 }

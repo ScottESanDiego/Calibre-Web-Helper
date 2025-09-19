@@ -41,6 +41,9 @@ pub enum Commands {
         /// The name of the shelf to filter by.
         #[clap(long)]
         shelf: Option<String>,
+        /// Show only books that aren't on any shelf
+        #[clap(long)]
+        unshelved: bool,
         /// List all attributes for each book.
         #[clap(long)]
         verbose: bool,

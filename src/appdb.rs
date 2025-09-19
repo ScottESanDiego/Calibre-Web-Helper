@@ -21,16 +21,37 @@ pub fn list_shelves(appdb_conn: Option<&Connection>) -> Result<()> {
     if let Some(conn) = appdb_conn {
         println!("📖 Finding available shelves from Calibre-Web...");
 
-        let mut stmt = conn.prepare("SELECT id, name FROM shelf ORDER BY name")?;
-        let shelves_iter = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
-        let shelves: Vec<(i64, String)> = shelves_iter.collect::<Result<Vec<(i64, String)>, _>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.name, s.kobo_sync, u.name as username, COUNT(bsl.book_id) as book_count
+             FROM shelf s 
+             LEFT JOIN user u ON s.user_id = u.id 
+             LEFT JOIN book_shelf_link bsl ON s.id = bsl.shelf
+             GROUP BY s.id, s.name, s.kobo_sync, u.name
+             ORDER BY u.name, s.name"
+        )?;
+        
+        let shelves_iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,           // shelf id
+                row.get::<_, String>(1)?,       // shelf name
+                row.get::<_, i64>(2)?,          // kobo_sync
+                row.get::<_, Option<String>>(3)?, // username (may be NULL)
+                row.get::<_, i64>(4)?           // book_count
+            ))
+        })?;
+        
+        let shelves: Vec<(i64, String, i64, Option<String>, i64)> = shelves_iter.collect::<Result<Vec<_>, _>>()?;
 
         if shelves.is_empty() {
             println!("\nNo shelves found in the Calibre-Web database.");
         } else {
             println!("\nAvailable shelves:");
-            for (id, shelf) in shelves {
-                println!("- {} (ID: {})", shelf, id);
+            for (id, shelf_name, kobo_sync, username, book_count) in shelves {
+                let user_display = username.unwrap_or_else(|| "Unknown".to_string());
+                let kobo_indicator = if kobo_sync == 1 { " [Kobo]" } else { "" };
+                let book_text = if book_count == 1 { "book" } else { "books" };
+                println!("- {} (ID: {}) - User: {}{} - {} {}", 
+                         shelf_name, id, user_display, kobo_indicator, book_count, book_text);
             }
         }
     } else {
