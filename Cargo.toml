@@ -1,9 +1,9 @@
 [package]
 name = "calibre-web-helper"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["ScottESanDiego"]
 edition = "2024"
-rust-version = "1.85"  # Minimum supported Rust version (required for 2024 edition)
+rust-version = "1.90"  # Minimum supported Rust version (required for 2024 edition)
 description = "A helper tool for managing Calibre and Calibre-Web libraries"
 license = "MIT"
 repository = "https://github.com/ScottESanDiego/Calibre-Web-Helper"
@@ -13,14 +13,14 @@ keywords = ["calibre", "ebook", "epub", "library", "metadata"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rusqlite = { version = "0.31.0", features = ["chrono", "uuid", "functions", "bundled"] }
-epub = "2.1.0"
-clap = { version = "4.5.4", features = ["derive"] }
-chrono = "0.4.38"
-uuid = { version = "1.8.0", features = ["v4"] }
-anyhow = "1.0.82"
-slug = "0.1.5"
-xml-rs = "0.8"
+rusqlite = { version = "0.37.0", features = ["chrono", "uuid", "functions", "bundled"] }
+epub = "2.1.4"
+clap = { version = "4.5.48", features = ["derive"] }
+chrono = "0.4.42"
+uuid = { version = "1.18.1", features = ["v4"] }
+anyhow = "1.0.100"
+slug = "0.1.6"
+xml-rs = "1.0"
 walkdir = "2.5.0"
-image = { version = "0.24.7", default-features = false, features = ["jpeg"] }
+image = { version = "0.25.8", default-features = false, features = ["jpeg"] }
 sha1 = "0.10.6"
