@@ -106,7 +106,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
 
     // Handle language codes with proper normalization
     let language = doc.mdata("language").map(|lang| {
-        let lang = lang.trim().to_lowercase();
+        let lang = lang.value.trim().to_lowercase();
         
         // Helper closure to normalize language codes
         let normalize_language = |code: &str| -> String {
@@ -159,9 +159,10 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         }
     });
 
-    let isbn = doc.metadata.get("identifier").and_then(|identifiers| {
-        identifiers.iter().find_map(|id| {
-            let id = id.trim();
+    let isbn = doc.metadata.iter()
+        .filter(|m| m.property == "identifier")
+        .find_map(|id| {
+            let id = id.value.trim();
             if id.starts_with("urn:isbn:") {
                 return Some(id.trim_start_matches("urn:isbn:").to_string());
             }
@@ -170,8 +171,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
                 return Some(digits);
             }
             None
-        })
-    });
+        });
 
     // Get publisher
     let publisher = doc.mdata("publisher");
@@ -180,7 +180,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     let pubdate = doc.mdata("date")
         .and_then(|date_str| {
             // Try various date formats
-            let date_str = date_str.trim();
+            let date_str = date_str.value.trim();
             
             // Try ISO8601/RFC3339 with time (YYYY-MM-DDThh:mm:ssZ)
             if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
@@ -229,14 +229,15 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     // Extract series information from metadata
     // Look for calibre:series and calibre:series_index first
     let series = doc.mdata("calibre:series")
+        .map(|s| s.value.clone())
         .or_else(|| {
             // Fallback to looking for series information in the title
             // Common format: Series Name #X - Book Title
-            let title = title.trim();
-            if let Some(hash_idx) = title.find('#') {
-                if let Some(_dash_idx) = title[hash_idx..].find('-') {
+            let title_str = title.value.trim();
+            if let Some(hash_idx) = title_str.find('#') {
+                if let Some(_dash_idx) = title_str[hash_idx..].find('-') {
                     // Extract everything before the # as the series name
-                    let series_part = title[..hash_idx].trim();
+                    let series_part = title_str[..hash_idx].trim();
                     if !series_part.is_empty() {
                         Some(series_part.to_string())
                     } else {
@@ -251,12 +252,12 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         });
 
     let series_index = doc.mdata("calibre:series_index")
-        .and_then(|idx| idx.parse::<f64>().ok())
+        .and_then(|idx| idx.value.parse::<f64>().ok())
         .or_else(|| {
             // Try to extract series index from title if in #X format
-            title.find('#')
+            title.value.find('#')
                 .and_then(|i| {
-                    let rest = &title[i + 1..];
+                    let rest = &title.value[i + 1..];
                     let num_str: String = rest.chars()
                         .take_while(|c| c.is_digit(10) || *c == '.')
                         .collect();
@@ -270,17 +271,17 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
         .len();
 
     Ok(BookMetadata {
-        title,
-        author,
+        title: title.value.clone(),
+        author: author.value.clone(),
         path: path.to_path_buf(),
-        description,
+        description: description.map(|d| d.value.clone()),
         language,
         isbn,
-        rights,
-        subtitle,
+        rights: rights.map(|r| r.value.clone()),
+        subtitle: subtitle.map(|s| s.value.clone()),
         series,
         series_index,
-        publisher,
+        publisher: publisher.map(|p| p.value.clone()),
         pubdate,
         file_size,
     })
