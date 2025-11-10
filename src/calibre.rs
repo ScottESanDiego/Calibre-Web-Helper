@@ -1,34 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
-use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash};
-
-pub struct BookMetadata {
-    pub title: String,
-    pub author: String,
-    pub path: std::path::PathBuf,
-    pub description: Option<String>,
-    pub language: Option<String>,
-    pub isbn: Option<String>,
-    pub rights: Option<String>,
-    pub subtitle: Option<String>,
-    pub series: Option<String>,
-    pub series_index: Option<f64>,
-    pub publisher: Option<String>,
-    pub pubdate: Option<DateTime<Utc>>,
-    pub file_size: u64,
-}
-
-#[derive(Debug)]
-struct ExistingBookData {
-    pub pubdate: Option<DateTime<Utc>>,
-    pub series_index: f64,
-    pub publisher: Option<String>,
-    pub series: Option<String>,
-}
+use crate::models::{BookMetadata, ExistingBookData, UpdateChanges, UpsertResult};
+use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash, validate_id, validate_table_name, validate_column_name};
 
 /// Retrieves existing book metadata for comparison
 fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookData> {
@@ -128,26 +105,6 @@ fn determine_changes(existing: &ExistingBookData, new_metadata: &BookMetadata) -
     changes
 }
 
-#[derive(Debug, Default)]
-struct UpdateChanges {
-    pubdate_changed: bool,
-    series_index_changed: bool,
-    publisher_changed: bool,
-    series_changed: bool,
-}
-
-impl UpdateChanges {
-    fn has_any_changes(&self) -> bool {
-        self.pubdate_changed || self.series_index_changed || self.publisher_changed || self.series_changed
-    }
-}
-
-pub enum UpsertResult {
-    Created { book_id: i64, book_path: String },
-    Updated { book_id: i64, book_path: String },
-    NoChanges { book_id: i64, book_path: String },
-}
-
 /// Handles the entire database transaction for adding a new book.
 /// If a book with the same title and author exists, it updates it. Otherwise, it creates a new one.
 pub fn add_book_to_db(
@@ -157,7 +114,19 @@ pub fn add_book_to_db(
     new_epub_file: &Path,
     dry_run: bool
 ) -> Result<UpsertResult> {
-    let tx = conn.transaction()?;
+    // Validate inputs
+    if metadata.title.trim().is_empty() {
+        anyhow::bail!("Book title cannot be empty");
+    }
+    if metadata.author.trim().is_empty() {
+        anyhow::bail!("Book author cannot be empty");
+    }
+    if !new_epub_file.exists() {
+        anyhow::bail!("EPUB file does not exist: {:?}", new_epub_file);
+    }
+
+    let tx = conn.transaction()
+        .context("Failed to start database transaction")?;
 
     // Check for an existing book by title and author sort key.
     let author_sort_name = get_author_sort(&metadata.author);
@@ -266,14 +235,18 @@ pub fn add_book_to_db(
             tx.execute(
                 "DELETE FROM books_publishers_link WHERE book = ?1",
                 params![book_id],
-            )?;
+            ).with_context(|| format!("Failed to delete old publisher link for book {}", book_id))?;
 
             if let Some(publisher_name) = &metadata.publisher {
-                let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
+                let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)
+                    .with_context(|| format!("Failed to find or create publisher '{}'", publisher_name))?;
                 tx.execute(
                     "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
                     params![book_id, publisher_id],
-                )?;
+                ).with_context(|| format!(
+                    "Failed to link book {} to publisher {}",
+                    book_id, publisher_id
+                ))?;
             }
         }
 
@@ -282,18 +255,23 @@ pub fn add_book_to_db(
             tx.execute(
                 "DELETE FROM books_series_link WHERE book = ?1",
                 params![book_id],
-            )?;
+            ).with_context(|| format!("Failed to delete old series link for book {}", book_id))?;
 
             if let Some(series_name) = &metadata.series {
-                let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
+                let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)
+                    .with_context(|| format!("Failed to find or create series '{}'", series_name))?;
                 tx.execute(
                     "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
                     params![book_id, series_id],
-                )?;
+                ).with_context(|| format!(
+                    "Failed to link book {} to series {}",
+                    book_id, series_id
+                ))?;
             }
         }
 
-        tx.commit()?;
+        tx.commit()
+            .context("Failed to commit book update transaction")?;
         return Ok(UpsertResult::Updated { book_id, book_path });
     }
 
@@ -314,7 +292,8 @@ pub fn add_book_to_db(
     }
     
     let author_sort_name = get_author_sort(&metadata.author);
-    let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)?;
+    let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)
+        .with_context(|| format!("Failed to find or create author '{}'", metadata.author))?;
 
     // 2. Insert the book record (with a temporary path)
     // Calibre expects timestamps with microsecond precision.
@@ -341,7 +320,7 @@ pub fn add_book_to_db(
             metadata.series_index.unwrap_or(1.0),
             &book_uuid,
         ],
-    )?;
+    ).with_context(|| format!("Failed to insert book '{}' into database", metadata.title))?;
     let book_id = tx.last_insert_rowid();
 
     // 3. Construct the final path and update the book record with it
@@ -350,13 +329,13 @@ pub fn add_book_to_db(
     tx.execute(
         "UPDATE books SET path = ?1 WHERE id = ?2",
         params![&book_path, book_id],
-    )?;
+    ).with_context(|| format!("Failed to update path for book {}", book_id))?;
 
     // 4. Link the book and author
     tx.execute(
         "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
         params![book_id, author_id],
-    )?;
+    ).with_context(|| format!("Failed to link book {} to author {}", book_id, author_id))?;
 
     // 5. Add the file format information to the 'data' table
     // Determine format based on filename
@@ -438,7 +417,8 @@ pub fn add_book_to_db(
         }
     }
 
-    tx.commit()?;
+    tx.commit()
+        .context("Failed to commit book creation transaction")?;
 
     Ok(UpsertResult::Created { book_id, book_path })
 }
@@ -615,12 +595,20 @@ pub fn list_books(
 
 /// Deletes a book from the database and filesystem.
 pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection>, library_db_path: &Path, book_id: i64) -> Result<()> {
+    // Validate book ID
+    validate_id(book_id, "book")?;
+    
+    // Create backup before destructive operation
+    crate::utils::backup_database(library_db_path, "delete_book")
+        .context("Failed to create database backup before deletion")?;
+    
     let book_info: Option<(String, String)> = calibre_conn.query_row(
             "SELECT title, path FROM books WHERE id = ?1",
             params![book_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?;
+        .optional()
+        .with_context(|| format!("Failed to query book with ID {}", book_id))?;
 
     let (_title, book_path_str) = if let Some((t, p)) = book_info.as_ref() {
         println!("You are about to delete:");
@@ -633,9 +621,12 @@ pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection
     };
 
     // Delete from DB. Triggers will handle linked tables.
-    let tx = calibre_conn.transaction()?;
-    let affected = tx.execute("DELETE FROM books WHERE id = ?1", params![book_id])?;
-    tx.commit()?;
+    let tx = calibre_conn.transaction()
+        .context("Failed to start deletion transaction")?;
+    let affected = tx.execute("DELETE FROM books WHERE id = ?1", params![book_id])
+        .with_context(|| format!("Failed to delete book {} from database", book_id))?;
+    tx.commit()
+        .context("Failed to commit deletion transaction")?;
 
     if affected == 0 && book_info.is_some() {
          anyhow::bail!("No book found with ID {} to delete.", book_id);
@@ -699,46 +690,6 @@ pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection
 }
 
 /// Creates Calibre-specific custom SQL functions needed by the database triggers.
-pub fn create_calibre_functions(conn: &Connection) -> Result<()> {
-    // Calibre's triggers use a custom `title_sort` function. We need to provide one.
-    // This is a simplified version for demonstration.
-    conn.create_scalar_function(
-        "title_sort",
-        1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        move |ctx| {
-            let title = ctx.get::<String>(0)?;
-            Ok(title_sort_logic(&title))
-        },
-    )?;
-
-    // The book insert trigger also requires a uuid4 function.
-    conn.create_scalar_function(
-        "uuid4",
-        0,
-        FunctionFlags::SQLITE_UTF8,
-        move |_ctx| {
-            Ok(Uuid::new_v4().to_string())
-        },
-    )?;
-
-    Ok(())
-}
-
-/// A simplified implementation of Calibre's title sorting logic.
-/// It moves common English articles to the end.
-fn title_sort_logic(title: &str) -> String {
-    let articles = ["the ", "a ", "an ", "le ", "la ", "les ", "el ", "los ", "las "];
-    let lower_title = title.to_lowercase();
-    for article in &articles {
-        if lower_title.starts_with(article) {
-            let len = article.len();
-            return format!("{}, {}", &title[len..], &title[..len - 1]);
-        }
-    }
-    title.to_string()
-}
-
 /// Helper function to get linked items like authors, tags, etc. for a book.
 fn get_linked_items(
     conn: &Connection,
@@ -747,11 +698,21 @@ fn get_linked_items(
     item_column: &str,
     book_id: i64,
 ) -> Result<Vec<String>> {
+    // Validate table and column names to prevent SQL injection
+    validate_table_name(item_table)
+        .with_context(|| format!("Invalid item table name: {}", item_table))?;
+    validate_table_name(link_table)
+        .with_context(|| format!("Invalid link table name: {}", link_table))?;
+    validate_column_name(item_column)
+        .with_context(|| format!("Invalid column name: {}", item_column))?;
+    validate_id(book_id, "book")?;
+    
     let query = format!(
         "SELECT t.name FROM {} t JOIN {} lt ON t.id = lt.{} WHERE lt.book = ?1",
         item_table, link_table, item_column
     );
-    let mut stmt = conn.prepare(&query)?;
+    let mut stmt = conn.prepare(&query)
+        .with_context(|| format!("Failed to prepare query for {}", item_table))?;
     let items_iter = stmt.query_map(params![book_id], |row| row.get(0))?;
     items_iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }

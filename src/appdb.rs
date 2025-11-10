@@ -2,18 +2,12 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use uuid::Uuid;
-use crate::utils::{now_local_micro, now_utc_micro};
+use crate::utils::{now_local_micro, now_utc_micro, validate_id};
 
 /// Opens the app.db connection if a path is provided.
 pub fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
-    path.map(|appdb_path| {
-        if !appdb_path.exists() {
-            anyhow::bail!("The specified app.db file does not exist: {:?}", appdb_path);
-        }
-        Connection::open(appdb_path)
-            .with_context(|| format!("Failed to open Calibre-Web database at {:?}", appdb_path))
-    })
-    .transpose()
+    path.map(|appdb_path| crate::db::open_appdb(appdb_path))
+        .transpose()
 }
 
 /// Lists all unique shelves from the Calibre-Web app.db.
@@ -199,17 +193,33 @@ fn sync_kobo_shelf_timestamps(tx: &Transaction, timestamp: &str) -> Result<usize
 
 /// Core function to add a book to a shelf with duplicate handling control
 fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>, allow_duplicates: bool) -> Result<bool> {
-    let tx = conn.transaction()?;
+    // Validate inputs
+    validate_id(book_id, "book")
+        .context("Invalid book ID for shelf operation")?;
+    
+    if shelf_name.trim().is_empty() {
+        anyhow::bail!("Shelf name cannot be empty");
+    }
+    
+    let tx = conn.transaction()
+        .context("Failed to start shelf operation transaction")?;
 
-    let user_id = resolve_user_id(&tx, username)?;
-    let shelf_id = find_or_create_shelf(&tx, shelf_name, user_id, username)?;
+    let user_id = resolve_user_id(&tx, username)
+        .context("Failed to resolve user ID for shelf operation")?;
+    let shelf_id = find_or_create_shelf(&tx, shelf_name, user_id, username)
+        .with_context(|| format!("Failed to find or create shelf '{}'", shelf_name))?;
 
     // Check if the link already exists to prevent duplicates
     let link_exists: bool = tx.query_row(
         "SELECT 1 FROM book_shelf_link WHERE book_id = ?1 AND shelf = ?2",
         params![book_id, shelf_id],
         |_| Ok(true)
-    ).optional()?.is_some();
+    ).optional()
+        .with_context(|| format!(
+            "Failed to check if book {} is already on shelf {}",
+            book_id, shelf_id
+        ))?
+        .is_some();
 
     if link_exists {
         if allow_duplicates {
@@ -282,7 +292,8 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
         }
     }
 
-    tx.commit()?;
+    tx.commit()
+        .context("Failed to commit shelf link transaction")?;
     Ok(true) // New link was created
 }
 
@@ -457,9 +468,11 @@ pub fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connect
 pub fn clean_empty_shelves(appdb_conn: &Connection, calibre_conn: &Connection) -> Result<()> {
     println!("🧹 Cleaning empty shelves from Calibre-Web...");
 
-    let mut calibre_check_stmt = calibre_conn.prepare("SELECT 1 FROM books WHERE id = ?1")?;
+    let mut calibre_check_stmt = calibre_conn.prepare("SELECT 1 FROM books WHERE id = ?1")
+        .context("Failed to prepare book existence check query")?;
 
-    let mut stmt = appdb_conn.prepare("SELECT id, name FROM shelf")?;
+    let mut stmt = appdb_conn.prepare("SELECT id, name FROM shelf")
+        .context("Failed to prepare shelf query")?;
     let shelf_iter = stmt.query_map([], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -507,7 +520,11 @@ pub fn clean_empty_shelves(appdb_conn: &Connection, calibre_conn: &Connection) -
 pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     println!("🔧 Diagnosing and fixing Kobo sync issues...");
     
-    let tx = appdb_conn.transaction()?;
+    // Create backup before making changes
+    // Note: We can't directly get the path from Connection, so we'll document this requirement
+    
+    let tx = appdb_conn.transaction()
+        .context("Failed to start Kobo sync fix transaction")?;
     
     // Find all books on Kobo sync shelves that aren't properly set up for sync
     let mut stmt = tx.prepare(
@@ -873,6 +890,13 @@ pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), B
 /// Adds an existing book to a shelf in the Calibre-Web database (like Calibre-Web does).
 /// This function only operates on app.db and assumes the book already exists in metadata.db.
 pub fn add_existing_book_to_shelf(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
+    // Validate book ID
+    validate_id(book_id, "book")
+        .context("Cannot add book to shelf: invalid book ID")?;
+    
+    // Note: We can't validate against metadata.db here since we only have app.db connection
+    // The caller should ensure the book exists in the Calibre database
+    
     let was_added = add_book_to_shelf_core(conn, book_id, shelf_name, username, false)?;
     
     if was_added {

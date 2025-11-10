@@ -5,6 +5,8 @@ use std::path::Path;
 
 mod cli;
 use cli::{Cli, Commands};
+mod models;
+mod db;
 mod appdb;
 mod epub;
 mod calibre;
@@ -34,16 +36,12 @@ fn main() -> Result<()> {
     }
 
     let mut calibre_conn = if let Some(ref metadata_file) = metadata_file {
-        Some(Connection::open(metadata_file)
-            .with_context(|| format!("Failed to open Calibre database at {:?}", metadata_file))?)
+        let conn = db::open_calibre_db(metadata_file)
+            .with_context(|| format!("Failed to open Calibre database at {:?}", metadata_file))?;
+        Some(conn)
     } else {
         None
     };
-
-    // Add the custom title_sort function that Calibre's triggers need
-    if let Some(ref conn) = calibre_conn {
-        calibre::create_calibre_functions(conn)?;
-    }
 
     let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
 
@@ -95,6 +93,12 @@ fn main() -> Result<()> {
         Commands::CleanShelves => {
             let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for clean-shelves command")?;
             if let Some(conn) = appdb_conn {
+                // Create backup before cleaning shelves
+                if let Some(ref appdb_path) = cli.appdb_file {
+                    println!("📦 Creating app.db backup before cleaning shelves...");
+                    crate::utils::backup_database(appdb_path, "clean_shelves")
+                        .context("Failed to backup app.db")?;
+                }
                 appdb::clean_empty_shelves(&conn, calibre_conn)?;
             }
         }
@@ -105,10 +109,27 @@ fn main() -> Result<()> {
         Commands::CleanDb => {
             let calibre_conn = calibre_conn.as_mut().context("--metadata-file is required for clean-db command")?;
             let metadata_file = metadata_file.as_ref().unwrap();
+            
+            // Create backup before cleanup
+            println!("📦 Creating database backups before cleanup...");
+            crate::utils::backup_database(metadata_file, "clean_db")
+                .context("Failed to backup metadata.db")?;
+            
+            if let Some(ref appdb_path) = cli.appdb_file {
+                crate::utils::backup_database(appdb_path, "clean_db")
+                    .context("Failed to backup app.db")?;
+            }
+            
             cleanup::cleanup_databases(calibre_conn, appdb_conn.as_mut(), &metadata_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())?;
         }
         Commands::FixKoboSync => {
             if let Some(mut conn) = appdb_conn {
+                // Create backup before fixing Kobo sync
+                if let Some(ref appdb_path) = cli.appdb_file {
+                    println!("📦 Creating app.db backup before Kobo sync fix...");
+                    crate::utils::backup_database(appdb_path, "fix_kobo_sync")
+                        .context("Failed to backup app.db")?;
+                }
                 appdb::fix_kobo_sync_issues(&mut conn)?;
             } else {
                 anyhow::bail!("--appdb-file is required for the fix-kobo-sync command");
@@ -124,6 +145,13 @@ fn main() -> Result<()> {
         Commands::AddToShelf { book_id, shelf, username } => {
             let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
             let mut appdb_conn = appdb::open_appdb(Some(appdb_path))?.context("Failed to open app.db")?;
+            
+            // Validate the book exists in metadata.db if available
+            if let Some(ref _metadata_file) = metadata_file {
+                let calibre_conn = calibre_conn.as_ref().context("Failed to get Calibre connection")?;
+                crate::utils::validate_foreign_key(calibre_conn, "books", book_id, "book")
+                    .context("Book does not exist in Calibre library")?;
+            }
             
             appdb::add_existing_book_to_shelf(&mut appdb_conn, book_id, &shelf, username.as_deref())
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -170,29 +198,22 @@ fn add_book_flow(
     let library_dir = library_db_path.parent().unwrap_or_else(|| Path::new("."));
     let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir, epub_file, dry_run)?;
 
-    let (book_id, book_path, is_update, skip_file_operations) = match upsert_result {
-        calibre::UpsertResult::Created { book_id, book_path } => {
-            println!(
-                " -> Successfully created database entry with Book ID: {}",
-                book_id
-            );
-            (book_id, book_path, false, false)
+    let book_id = upsert_result.book_id();
+    let book_path = upsert_result.book_path().to_string();
+    let is_update = upsert_result.is_update();
+    let skip_file_operations = upsert_result.skip_file_operations();
+
+    match &upsert_result {
+        models::UpsertResult::Created { book_id, .. } => {
+            println!(" -> Successfully created database entry with Book ID: {}", book_id);
         }
-        calibre::UpsertResult::Updated { book_id, book_path } => {
-            println!(
-                " -> Successfully updated database entry for Book ID: {}",
-                book_id
-            );
-            (book_id, book_path, true, false)
+        models::UpsertResult::Updated { book_id, .. } => {
+            println!(" -> Successfully updated database entry for Book ID: {}", book_id);
         }
-        calibre::UpsertResult::NoChanges { book_id, book_path } => {
-            println!(
-                " -> No changes needed for Book ID: {}",
-                book_id
-            );
-            (book_id, book_path, true, true)
+        models::UpsertResult::NoChanges { book_id, .. } => {
+            println!(" -> No changes needed for Book ID: {}", book_id);
         }
-    };
+    }
 
     // Clap's `requires` attribute ensures appdb_conn is Some if shelf_name is Some.
     if let (Some(name), Some(conn)) = (shelf_name, appdb_conn) {

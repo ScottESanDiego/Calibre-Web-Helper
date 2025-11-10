@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use crate::calibre::BookMetadata;
+use crate::models::BookMetadata;
 
 /// Maximum cover image size in bytes (200KB)
 const MAX_COVER_SIZE: u64 = 200 * 1024;

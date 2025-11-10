@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local, TimeZone, Utc};
-use rusqlite::{params, Transaction, Error as SqliteError, Connection};
-use anyhow::Result;
+use rusqlite::{params, Transaction, Error as SqliteError, Connection, OptionalExtension};
+use anyhow::{Result, Context};
 use sha1::{Sha1, Digest};
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 
 /// Format a timestamp with microsecond precision for database storage
 /// This matches the format used by both Calibre and Calibre-Web
@@ -236,4 +237,121 @@ pub fn calculate_file_hash(file_path: &std::path::Path) -> Result<String> {
     }
     
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Validates that an ID is positive and within reasonable bounds
+pub fn validate_id(id: i64, entity_type: &str) -> Result<()> {
+    if id <= 0 {
+        anyhow::bail!("Invalid {} ID: {}. ID must be positive.", entity_type, id);
+    }
+    if id > i64::MAX / 2 {
+        anyhow::bail!("Invalid {} ID: {}. ID is unreasonably large.", entity_type, id);
+    }
+    Ok(())
+}
+
+/// Validates a table name to prevent SQL injection
+/// Only allows alphanumeric characters and underscores
+pub fn validate_table_name(table_name: &str) -> Result<()> {
+    if table_name.is_empty() {
+        anyhow::bail!("Table name cannot be empty");
+    }
+    
+    if !table_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "Invalid table name '{}'. Only alphanumeric characters and underscores allowed.",
+            table_name
+        );
+    }
+    
+    // Check against known valid table names
+    const VALID_TABLES: &[&str] = &[
+        "books", "authors", "publishers", "tags", "series", "languages",
+        "books_authors_link", "books_publishers_link", "books_tags_link",
+        "books_series_link", "books_languages_link", "identifiers",
+        "comments", "data", "shelf", "book_shelf_link", "user",
+        "kobo_reading_state", "kobo_bookmark", "kobo_statistics",
+        "kobo_synced_books", "book_read_link"
+    ];
+    
+    if !VALID_TABLES.contains(&table_name) {
+        anyhow::bail!(
+            "Table name '{}' is not in the list of known valid tables",
+            table_name
+        );
+    }
+    
+    Ok(())
+}
+
+/// Validates a column name to prevent SQL injection
+pub fn validate_column_name(column_name: &str) -> Result<()> {
+    if column_name.is_empty() {
+        anyhow::bail!("Column name cannot be empty");
+    }
+    
+    if !column_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "Invalid column name '{}'. Only alphanumeric characters and underscores allowed.",
+            column_name
+        );
+    }
+    
+    Ok(())
+}
+
+/// Creates a backup of a database file
+pub fn backup_database(db_path: &Path, operation_name: &str) -> Result<std::path::PathBuf> {
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let backup_name = format!(
+        "{}_backup_{}_{}.db",
+        db_path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("database"),
+        operation_name,
+        timestamp
+    );
+    
+    let backup_path = db_path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(backup_name);
+    
+    std::fs::copy(db_path, &backup_path)
+        .with_context(|| format!(
+            "Failed to create backup of {:?} to {:?}",
+            db_path, backup_path
+        ))?;
+    
+    println!(" -> Created database backup: {:?}", backup_path);
+    Ok(backup_path)
+}
+
+/// Validates foreign key existence in a table
+pub fn validate_foreign_key(
+    conn: &Connection,
+    table_name: &str,
+    id: i64,
+    entity_type: &str,
+) -> Result<()> {
+    validate_table_name(table_name)?;
+    validate_id(id, entity_type)?;
+    
+    let query = format!("SELECT 1 FROM {} WHERE id = ?1", table_name);
+    let exists: bool = conn
+        .query_row(&query, params![id], |_| Ok(true))
+        .optional()
+        .with_context(|| format!(
+            "Failed to validate {} with ID {} in table {}",
+            entity_type, id, table_name
+        ))?
+        .is_some();
+    
+    if !exists {
+        anyhow::bail!(
+            "{} with ID {} does not exist in table {}",
+            entity_type, id, table_name
+        );
+    }
+    
+    Ok(())
 }
