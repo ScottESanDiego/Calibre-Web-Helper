@@ -83,6 +83,3 @@ impl UpsertResult {
         matches!(self, UpsertResult::NoChanges { .. })
     }
 }
-
-/// Type alias for application results
-pub type AppResult<T> = anyhow::Result<T>;
