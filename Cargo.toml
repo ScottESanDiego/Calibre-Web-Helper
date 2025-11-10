@@ -1,6 +1,6 @@
 [package]
 name = "calibre-web-helper"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["ScottESanDiego"]
 edition = "2024"
 rust-version = "1.90"  # Minimum supported Rust version (required for 2024 edition)
