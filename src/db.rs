@@ -27,16 +27,13 @@ pub fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Connectio
         .with_context(|| format!("Failed to open database at {:?}", path))?;
 
     if config.enable_foreign_keys {
-        conn.execute("PRAGMA foreign_keys = ON", [])
+        conn.pragma_update(None, "foreign_keys", "ON")
             .context("Failed to enable foreign key constraints")?;
     }
 
     if config.busy_timeout_ms > 0 {
-        conn.execute(
-            &format!("PRAGMA busy_timeout = {}", config.busy_timeout_ms),
-            [],
-        )
-        .context("Failed to set busy timeout")?;
+        conn.busy_timeout(std::time::Duration::from_millis(config.busy_timeout_ms as u64))
+            .context("Failed to set busy timeout")?;
     }
 
     Ok(conn)
