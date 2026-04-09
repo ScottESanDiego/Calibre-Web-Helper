@@ -3,13 +3,19 @@ use regex::Regex;
 use rusqlite::{params, Transaction, Error as SqliteError, Connection, OptionalExtension};
 use anyhow::{Result, Context};
 use sha1::{Sha1, Digest};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+static BAD_CHARS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[*+:\\"/<>?]+"#).expect("invalid regex"));
+static PIPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[|]+").expect("invalid regex"));
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^[\s\u{200B}-\u{200D}\u{FEFF}]+)|([\s\u{200B}-\u{200D}\u{FEFF}]+$)").expect("invalid regex"));
+static SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^((JR|SR)\.?|I{1,3}\.?|IV\.?)$").expect("invalid regex"));
 
 /// Format a timestamp with microsecond precision for database storage
 /// This matches the format used by both Calibre and Calibre-Web
-pub fn format_timestamp_micro<Tz: TimeZone>(dt: &DateTime<Tz>) -> String 
+pub(crate) fn format_timestamp_micro<Tz: TimeZone>(dt: &DateTime<Tz>) -> String 
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -17,7 +23,7 @@ where
 }
 
 /// Get current UTC timestamp formatted for database storage
-pub fn now_utc_micro() -> String {
+pub(crate) fn now_utc_micro() -> String {
     format_timestamp_micro(&Utc::now())
 }
 
@@ -38,7 +44,7 @@ const TITLE_ARTICLES: &[&str] = &[
 /// - Pipe `|` becomes comma
 /// - Truncated to `max_chars` bytes (UTF-8 aware)
 /// - Leading/trailing whitespace and zero-width characters stripped
-pub fn get_valid_filename(value: &str, max_chars: usize) -> String {
+pub(crate) fn get_valid_filename(value: &str, max_chars: usize) -> String {
     let mut s = value.to_string();
 
     // Trailing dot -> underscore (matches Python: value[-1:] == '.')
@@ -48,15 +54,13 @@ pub fn get_valid_filename(value: &str, max_chars: usize) -> String {
     }
 
     // Replace / and : with _  and strip NUL bytes
-    s = s.replace('/', "_").replace(':', "_").replace('\0', "");
+    s = s.replace(['/', ':'], "_").replace('\0', "");
 
     // Replace *+:\"/<>? with _
-    let bad_chars = Regex::new(r#"[*+:\\"/<>?]+"#).unwrap();
-    s = bad_chars.replace_all(&s, "_").to_string();
+    s = BAD_CHARS_RE.replace_all(&s, "_").to_string();
 
     // Replace | with ,
-    let pipe = Regex::new(r"[|]+").unwrap();
-    s = pipe.replace_all(&s, ",").to_string();
+    s = PIPE_RE.replace_all(&s, ",").to_string();
 
     // Truncate to max_chars bytes, respecting UTF-8 boundaries
     if s.len() > max_chars {
@@ -73,8 +77,7 @@ pub fn get_valid_filename(value: &str, max_chars: usize) -> String {
 /// Strip leading/trailing whitespace and Unicode zero-width characters,
 /// matching Calibre-Web's `strip_whitespaces()`.
 fn strip_whitespaces(text: &str) -> String {
-    let re = Regex::new(r"(?:^[\s\u{200B}-\u{200D}\u{FEFF}]+)|([\s\u{200B}-\u{200D}\u{FEFF}]+$)").unwrap();
-    re.replace_all(text, "").to_string()
+    WHITESPACE_RE.replace_all(text, "").to_string()
 }
 
 /// Compute title sort using the same logic as Calibre-Web's `title_sort()` from `db.py`.
@@ -82,7 +85,7 @@ fn strip_whitespaces(text: &str) -> String {
 /// Matches leading articles and moves them to the end:
 /// "The Great Book" -> "Great Book, The"
 /// "L'Étranger" -> "Étranger, L'"
-pub fn title_sort(title: &str) -> String {
+pub(crate) fn title_sort(title: &str) -> String {
     // Special-case L' (French elided article) first
     let lower = title.to_lowercase();
     if lower.starts_with("l'") {
@@ -108,20 +111,19 @@ pub fn title_sort(title: &str) -> String {
 /// "John Doe" -> "Doe, John"
 /// "Robert Downey Jr." -> "Downey, Robert Jr."
 /// Already-comma-separated names are returned as-is.
-pub fn get_sorted_author(value: &str) -> String {
+pub(crate) fn get_sorted_author(value: &str) -> String {
     let value = value.trim();
     if value.contains(',') {
         return value.to_string();
     }
 
-    let suffix_re = Regex::new(r"(?i)^((JR|SR)\.?|I{1,3}\.?|IV\.?)$").unwrap();
     let parts: Vec<&str> = value.split_whitespace().collect();
 
     if parts.is_empty() {
         return value.to_string();
     }
 
-    if suffix_re.is_match(parts[parts.len() - 1]) {
+    if SUFFIX_RE.is_match(parts[parts.len() - 1]) {
         if parts.len() > 1 {
             let suffix = parts[parts.len() - 1];
             let last = parts[parts.len() - 2];
@@ -146,7 +148,7 @@ pub fn get_sorted_author(value: &str) -> String {
 /// Mark a book as metadata-dirty in the Calibre database.
 /// Calibre-Web writes to `metadata_dirtied` so the Calibre desktop app
 /// knows which OPF files to regenerate.
-pub fn set_metadata_dirty(conn: &Connection, book_id: i64) -> Result<()> {
+pub(crate) fn set_metadata_dirty(conn: &Connection, book_id: i64) -> Result<()> {
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM metadata_dirtied WHERE book = ?1",
@@ -180,7 +182,7 @@ pub fn set_metadata_dirty(conn: &Connection, book_id: i64) -> Result<()> {
 ///
 /// # Returns
 /// The id of the found or created record
-pub fn find_or_create<P1, P2>(
+pub(crate) fn find_or_create<P1, P2>(
     tx: &Transaction,
     find_query: &str,
     find_params: P1,
@@ -203,11 +205,13 @@ where
 
 /// Simplified find-or-create for cases where we just need to find by name
 /// and insert with name (common pattern for publishers, simple entities)
-pub fn find_or_create_by_name(
+pub(crate) fn find_or_create_by_name(
     tx: &Transaction,
     table_name: &str,
     name: &str,
 ) -> Result<i64, SqliteError> {
+    validate_table_name(table_name)
+        .map_err(|e| SqliteError::InvalidParameterName(e.to_string()))?;
     let find_query = format!("SELECT id FROM {} WHERE name = ?1", table_name);
     let insert_query = format!("INSERT INTO {} (name) VALUES (?1)", table_name);
     
@@ -222,12 +226,14 @@ pub fn find_or_create_by_name(
 
 /// Find-or-create for entities that have both name and sort fields
 /// (common pattern for authors, series)
-pub fn find_or_create_by_name_and_sort(
+pub(crate) fn find_or_create_by_name_and_sort(
     tx: &Transaction,
     table_name: &str,
     name: &str,
     sort: &str,
 ) -> Result<i64, SqliteError> {
+    validate_table_name(table_name)
+        .map_err(|e| SqliteError::InvalidParameterName(e.to_string()))?;
     let find_query = format!("SELECT id FROM {} WHERE name = ?1", table_name);
     let insert_query = format!("INSERT INTO {} (name, sort) VALUES (?1, ?2)", table_name);
     
@@ -241,7 +247,7 @@ pub fn find_or_create_by_name_and_sort(
 }
 
 /// Find-or-create for language codes (special case for languages table)
-pub fn find_or_create_language(
+pub(crate) fn find_or_create_language(
     tx: &Transaction,
     lang_code: &str,
 ) -> Result<i64, SqliteError> {
@@ -256,7 +262,7 @@ pub fn find_or_create_language(
 
 /// Verifies and repairs any NULL timestamp values in both databases.
 /// This is run automatically when opening the databases to prevent NULL value errors.
-pub fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: Option<&mut Connection>) -> Result<()> {
+pub(crate) fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: Option<&mut Connection>) -> Result<()> {
     // Fix timestamps in Calibre database
     let tx = calibre_conn.transaction()?;
     
@@ -363,8 +369,21 @@ pub fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: O
     Ok(())
 }
 
+/// Detect the book format and file extension from a path.
+/// Returns `(format, extension)` e.g. `("KEPUB", ".kepub")` or `("EPUB", ".epub")`.
+pub(crate) fn detect_book_format(path: &Path) -> Result<(&'static str, &'static str)> {
+    let path_str = path.to_string_lossy();
+    if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
+        Ok(("KEPUB", ".kepub"))
+    } else if path_str.ends_with(".epub") {
+        Ok(("EPUB", ".epub"))
+    } else {
+        anyhow::bail!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub")
+    }
+}
+
 /// Calculate SHA1 hash of a file
-pub fn calculate_file_hash(file_path: &std::path::Path) -> Result<String> {
+pub(crate) fn calculate_file_hash(file_path: &Path) -> Result<String> {
     let mut file = File::open(file_path)?;
     let mut hasher = Sha1::new();
     let mut buffer = [0; 8192]; // 8KB buffer for reading chunks
@@ -382,7 +401,7 @@ pub fn calculate_file_hash(file_path: &std::path::Path) -> Result<String> {
 }
 
 /// Validates that an ID is positive and within reasonable bounds
-pub fn validate_id(id: i64, entity_type: &str) -> Result<()> {
+pub(crate) fn validate_id(id: i64, entity_type: &str) -> Result<()> {
     if id <= 0 {
         anyhow::bail!("Invalid {} ID: {}. ID must be positive.", entity_type, id);
     }
@@ -394,7 +413,7 @@ pub fn validate_id(id: i64, entity_type: &str) -> Result<()> {
 
 /// Validates a table name to prevent SQL injection
 /// Only allows alphanumeric characters and underscores
-pub fn validate_table_name(table_name: &str) -> Result<()> {
+pub(crate) fn validate_table_name(table_name: &str) -> Result<()> {
     if table_name.is_empty() {
         anyhow::bail!("Table name cannot be empty");
     }
@@ -427,7 +446,7 @@ pub fn validate_table_name(table_name: &str) -> Result<()> {
 }
 
 /// Validates a column name to prevent SQL injection
-pub fn validate_column_name(column_name: &str) -> Result<()> {
+pub(crate) fn validate_column_name(column_name: &str) -> Result<()> {
     if column_name.is_empty() {
         anyhow::bail!("Column name cannot be empty");
     }
@@ -443,7 +462,7 @@ pub fn validate_column_name(column_name: &str) -> Result<()> {
 }
 
 /// Creates a backup of a database file
-pub fn backup_database(db_path: &Path, operation_name: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn backup_database(db_path: &Path, operation_name: &str) -> Result<PathBuf> {
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!(
         "{}_backup_{}_{}.db",
@@ -458,7 +477,7 @@ pub fn backup_database(db_path: &Path, operation_name: &str) -> Result<std::path
         .unwrap_or_else(|| Path::new("."))
         .join(backup_name);
     
-    std::fs::copy(db_path, &backup_path)
+    fs::copy(db_path, &backup_path)
         .with_context(|| format!(
             "Failed to create backup of {:?} to {:?}",
             db_path, backup_path
@@ -469,7 +488,7 @@ pub fn backup_database(db_path: &Path, operation_name: &str) -> Result<std::path
 }
 
 /// Validates foreign key existence in a table
-pub fn validate_foreign_key(
+pub(crate) fn validate_foreign_key(
     conn: &Connection,
     table_name: &str,
     id: i64,

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, Transaction, OptionalExtension};
 use std::collections::HashSet;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use crate::models::{BookMetadata, ExistingBookData, UpdateChanges, UpsertResult};
-use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash, validate_id, validate_table_name, validate_column_name, get_valid_filename, title_sort as compute_title_sort, get_sorted_author, set_metadata_dirty};
+use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash, validate_id, validate_table_name, validate_column_name, get_valid_filename, title_sort as compute_title_sort, get_sorted_author, set_metadata_dirty, detect_book_format};
 
 /// Retrieves existing book metadata for comparison
 fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookData> {
@@ -13,7 +14,7 @@ fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookD
     let (pubdate_str, series_index): (Option<String>, f64) = tx.query_row(
         "SELECT pubdate, series_index FROM books WHERE id = ?1",
         params![book_id],
-        |row| Ok((row.get(1)?, row.get(2)?))
+        |row| Ok((row.get(0)?, row.get(1)?))
     )?;
     
     // Parse pubdate if it exists
@@ -56,14 +57,14 @@ fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookD
 }
 
 /// Get the file path of an existing book in the library
-fn get_existing_book_file_path(library_dir: &Path, book_path: &str, _book_id: i64) -> Result<Option<std::path::PathBuf>> {
+fn get_existing_book_file_path(library_dir: &Path, book_path: &str) -> Result<Option<PathBuf>> {
     let book_dir = library_dir.join(book_path);
     if !book_dir.exists() {
         return Ok(None);
     }
     
     // Look for EPUB or KEPUB files in the book directory
-    for entry in std::fs::read_dir(&book_dir)? {
+    for entry in fs::read_dir(&book_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() {
@@ -105,16 +106,15 @@ fn determine_changes(existing: &ExistingBookData, new_metadata: &BookMetadata) -
     changes
 }
 
-/// Handles the entire database transaction for adding a new book.
+/// Handles the database transaction for adding or updating a book.
 /// If a book with the same title and author exists, it updates it. Otherwise, it creates a new one.
-pub fn add_book_to_db(
+pub(crate) fn add_book_to_db(
     conn: &mut Connection, 
     metadata: &BookMetadata, 
     library_dir: &Path, 
     new_epub_file: &Path,
     dry_run: bool
 ) -> Result<UpsertResult> {
-    // Validate inputs
     if metadata.title.trim().is_empty() {
         anyhow::bail!("Book title cannot be empty");
     }
@@ -128,157 +128,154 @@ pub fn add_book_to_db(
     let tx = conn.transaction()
         .context("Failed to start database transaction")?;
 
-    // Check for an existing book by title and author sort key.
-    let author_sort_name = get_author_sort_value(&metadata.author);
+    let author_sort_name = get_sorted_author(&metadata.author);
     let existing_book: Option<(i64, String)> = tx.query_row(
         "SELECT id, path FROM books WHERE title = ?1 AND author_sort = ?2",
         params![&metadata.title, &author_sort_name],
         |row| Ok((row.get(0)?, row.get(1)?))
     ).optional()?;
 
-    if let Some((book_id, book_path)) = existing_book {
-        // UPDATE PATH - Fast-path: Check if files are identical using hash comparison
-        println!(" -> Found existing book with ID: {}. Checking file hash...", book_id);
-        
-        // Calculate hash of the new EPUB file
-        let new_file_hash = calculate_file_hash(new_epub_file)?;
-        
-        // Try to find and hash the existing file
-        if let Some(existing_file_path) = get_existing_book_file_path(library_dir, &book_path, book_id)? {
-            if let Ok(existing_file_hash) = calculate_file_hash(&existing_file_path) {
-                if new_file_hash == existing_file_hash {
-                    println!(" -> Files are identical (same hash). No changes needed.");
-                    if dry_run {
-                        println!("   [DRY RUN] Would skip all operations");
-                    }
-                    tx.commit()?;
-                    return Ok(UpsertResult::NoChanges { book_id, book_path });
-                } else {
-                    if dry_run {
-                        println!(" -> Files differ (different hash). Would check metadata changes...");
-                    } else {
-                        println!(" -> Files differ (different hash). Checking metadata changes...");
-                    }
+    let result = if let Some((book_id, book_path)) = existing_book {
+        update_book(&tx, book_id, &book_path, metadata, library_dir, new_epub_file, dry_run)?
+    } else {
+        create_book(&tx, metadata, dry_run)?
+    };
+
+    tx.commit()
+        .context("Failed to commit book transaction")?;
+
+    Ok(result)
+}
+
+/// Updates an existing book's metadata when the EPUB file or metadata has changed.
+fn update_book(
+    tx: &Transaction,
+    book_id: i64,
+    book_path: &str,
+    metadata: &BookMetadata,
+    library_dir: &Path,
+    new_epub_file: &Path,
+    dry_run: bool,
+) -> Result<UpsertResult> {
+    println!(" -> Found existing book with ID: {}. Checking file hash...", book_id);
+
+    let new_file_hash = calculate_file_hash(new_epub_file)?;
+
+    if let Some(existing_file_path) = get_existing_book_file_path(library_dir, book_path)? {
+        if let Ok(existing_file_hash) = calculate_file_hash(&existing_file_path) {
+            if new_file_hash == existing_file_hash {
+                println!(" -> Files are identical (same hash). No changes needed.");
+                if dry_run {
+                    println!("   [DRY RUN] Would skip all operations");
                 }
+                return Ok(UpsertResult::NoChanges { book_id, book_path: book_path.to_string() });
+            } else if dry_run {
+                println!(" -> Files differ (different hash). Would check metadata changes...");
             } else {
-                println!(" -> Could not hash existing file. Proceeding with metadata comparison...");
+                println!(" -> Files differ (different hash). Checking metadata changes...");
             }
         } else {
-            println!(" -> Existing file not found. Proceeding with update...");
+            println!(" -> Could not hash existing file. Proceeding with metadata comparison...");
         }
-        
-        // Get existing book data for comparison
-        let existing_data = get_existing_book_data(&tx, book_id)?;
-        let changes = determine_changes(&existing_data, metadata);
-        
-        if !changes.has_any_changes() {
-            if dry_run {
-                println!(" -> No metadata changes detected. Would skip database update.");
-                println!("   [DRY RUN] Would skip all operations");
-            } else {
-                println!(" -> No metadata changes detected. Skipping database update.");
-            }
-            tx.commit()?;
-            return Ok(UpsertResult::NoChanges { book_id, book_path });
-        }
-        
-        if dry_run {
-            println!(" -> Metadata changes detected. Would update database...");
-            println!("   [DRY RUN] Would update: pubdate={}, series_index={}, publisher={}, series={}", 
-                changes.pubdate_changed, changes.series_index_changed, 
-                changes.publisher_changed, changes.series_changed);
-            tx.commit()?;
-            return Ok(UpsertResult::Updated { book_id, book_path });
-        }
-        
-        println!(" -> Metadata changes detected. Updating database...");
-        let now_str = now_utc_micro();
-        
-        // Always update last_modified when changes are detected
-        // Update other fields only if they changed
-        if changes.pubdate_changed && changes.series_index_changed {
-            if let Some(pubdate) = metadata.pubdate {
-                let pubdate_str = format_timestamp_micro(&pubdate);
-                tx.execute(
-                    "UPDATE books SET last_modified = ?1, pubdate = ?2, series_index = ?3 WHERE id = ?4",
-                    params![&now_str, &pubdate_str, metadata.series_index.unwrap_or(1.0), book_id],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE books SET last_modified = ?1, series_index = ?2 WHERE id = ?3",
-                    params![&now_str, metadata.series_index.unwrap_or(1.0), book_id],
-                )?;
-            }
-        } else if changes.pubdate_changed {
-            if let Some(pubdate) = metadata.pubdate {
-                let pubdate_str = format_timestamp_micro(&pubdate);
-                tx.execute(
-                    "UPDATE books SET last_modified = ?1, pubdate = ?2 WHERE id = ?3",
-                    params![&now_str, &pubdate_str, book_id],
-                )?;
-            }
-        } else if changes.series_index_changed {
-            tx.execute(
-                "UPDATE books SET last_modified = ?1, series_index = ?2 WHERE id = ?3",
-                params![&now_str, metadata.series_index.unwrap_or(1.0), book_id],
-            )?;
-        } else {
-            // Only last_modified needs updating
-            tx.execute(
-                "UPDATE books SET last_modified = ?1 WHERE id = ?2",
-                params![&now_str, book_id],
-            )?;
-        }
-
-        // Update publisher information only if changed
-        if changes.publisher_changed {
-            tx.execute(
-                "DELETE FROM books_publishers_link WHERE book = ?1",
-                params![book_id],
-            ).with_context(|| format!("Failed to delete old publisher link for book {}", book_id))?;
-
-            if let Some(publisher_name) = &metadata.publisher {
-                let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)
-                    .with_context(|| format!("Failed to find or create publisher '{}'", publisher_name))?;
-                tx.execute(
-                    "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
-                    params![book_id, publisher_id],
-                ).with_context(|| format!(
-                    "Failed to link book {} to publisher {}",
-                    book_id, publisher_id
-                ))?;
-            }
-        }
-
-        // Update series information only if changed
-        if changes.series_changed {
-            tx.execute(
-                "DELETE FROM books_series_link WHERE book = ?1",
-                params![book_id],
-            ).with_context(|| format!("Failed to delete old series link for book {}", book_id))?;
-
-            if let Some(series_name) = &metadata.series {
-                let series_sort = compute_title_sort(series_name);
-            let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, &series_sort)
-                    .with_context(|| format!("Failed to find or create series '{}'", series_name))?;
-                tx.execute(
-                    "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
-                    params![book_id, series_id],
-                ).with_context(|| format!(
-                    "Failed to link book {} to series {}",
-                    book_id, series_id
-                ))?;
-            }
-        }
-
-        set_metadata_dirty(&tx, book_id)?;
-
-        tx.commit()
-            .context("Failed to commit book update transaction")?;
-        return Ok(UpsertResult::Updated { book_id, book_path });
+    } else {
+        println!(" -> Existing file not found. Proceeding with update...");
     }
 
-    // CREATE PATH
+    let existing_data = get_existing_book_data(tx, book_id)?;
+    let changes = determine_changes(&existing_data, metadata);
+
+    if !changes.has_any_changes() {
+        if dry_run {
+            println!(" -> No metadata changes detected. Would skip database update.");
+            println!("   [DRY RUN] Would skip all operations");
+        } else {
+            println!(" -> No metadata changes detected. Skipping database update.");
+        }
+        return Ok(UpsertResult::NoChanges { book_id, book_path: book_path.to_string() });
+    }
+
+    if dry_run {
+        println!(" -> Metadata changes detected. Would update database...");
+        println!("   [DRY RUN] Would update: pubdate={}, series_index={}, publisher={}, series={}",
+            changes.pubdate_changed, changes.series_index_changed,
+            changes.publisher_changed, changes.series_changed);
+        return Ok(UpsertResult::Updated { book_id, book_path: book_path.to_string() });
+    }
+
+    println!(" -> Metadata changes detected. Updating database...");
+    let now_str = now_utc_micro();
+
+    let mut set_clauses: Vec<String> = vec!["last_modified = ?".to_string()];
+    let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_str)];
+
+    if changes.pubdate_changed
+        && let Some(pubdate) = metadata.pubdate {
+            set_clauses.push("pubdate = ?".to_string());
+            param_values.push(Box::new(format_timestamp_micro(&pubdate)));
+        }
+    if changes.series_index_changed {
+        set_clauses.push("series_index = ?".to_string());
+        param_values.push(Box::new(metadata.series_index.unwrap_or(1.0)));
+    }
+
+    param_values.push(Box::new(book_id));
+    let sql = format!(
+        "UPDATE books SET {} WHERE id = ?",
+        set_clauses.join(", ")
+    );
+    let param_refs: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    tx.execute(&sql, &param_refs[..])?;
+
+    if changes.publisher_changed {
+        tx.execute(
+            "DELETE FROM books_publishers_link WHERE book = ?1",
+            params![book_id],
+        ).with_context(|| format!("Failed to delete old publisher link for book {}", book_id))?;
+
+        if let Some(publisher_name) = &metadata.publisher {
+            let publisher_id = find_or_create_by_name(tx, "publishers", publisher_name)
+                .with_context(|| format!("Failed to find or create publisher '{}'", publisher_name))?;
+            tx.execute(
+                "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
+                params![book_id, publisher_id],
+            ).with_context(|| format!(
+                "Failed to link book {} to publisher {}",
+                book_id, publisher_id
+            ))?;
+        }
+    }
+
+    if changes.series_changed {
+        tx.execute(
+            "DELETE FROM books_series_link WHERE book = ?1",
+            params![book_id],
+        ).with_context(|| format!("Failed to delete old series link for book {}", book_id))?;
+
+        if let Some(series_name) = &metadata.series {
+            let series_sort = compute_title_sort(series_name);
+            let series_id = find_or_create_by_name_and_sort(tx, "series", series_name, &series_sort)
+                .with_context(|| format!("Failed to find or create series '{}'", series_name))?;
+            tx.execute(
+                "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
+                params![book_id, series_id],
+            ).with_context(|| format!(
+                "Failed to link book {} to series {}",
+                book_id, series_id
+            ))?;
+        }
+    }
+
+    set_metadata_dirty(tx, book_id)?;
+
+    Ok(UpsertResult::Updated { book_id, book_path: book_path.to_string() })
+}
+
+/// Creates a brand new book record with all associated metadata.
+fn create_book(
+    tx: &Transaction,
+    metadata: &BookMetadata,
+    dry_run: bool,
+) -> Result<UpsertResult> {
     if dry_run {
         println!(" -> Would create new book with title: '{}'", metadata.title);
         println!(" -> Would assign author: '{}'", metadata.author);
@@ -289,28 +286,21 @@ pub fn add_book_to_db(
             println!(" -> Would add to series: '{}'", series);
         }
         println!("   [DRY RUN] Would create new database entry and copy files");
-        tx.commit()?;
         let dry_author = get_valid_filename(&metadata.author, 96);
         let dry_title = get_valid_filename(&metadata.title, 96);
         return Ok(UpsertResult::Created { book_id: 0, book_path: format!("{}/{} (NEW)", dry_author, dry_title) });
     }
-    
-    let author_sort_name = get_author_sort_value(&metadata.author);
-    let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)
+
+    let author_sort_name = get_sorted_author(&metadata.author);
+    let author_id = find_or_create_by_name_and_sort(tx, "authors", &metadata.author, &author_sort_name)
         .with_context(|| format!("Failed to find or create author '{}'", metadata.author))?;
 
-    // 2. Insert the book record (with a temporary path)
-    // Calibre expects timestamps with microsecond precision.
     let now = Utc::now();
     let now_str = format_timestamp_micro(&now);
     let pubdate_str = format_timestamp_micro(&metadata.pubdate.unwrap_or(now));
-    
-    // Generate a UUID for the book
     let book_uuid = Uuid::new_v4().to_string();
-    
-    // Get proper title sort (similar to author sort)
-    let title_sort = get_title_sort(&metadata.title);
-        
+    let title_sort = compute_title_sort(&metadata.title);
+
     tx.execute(
         "INSERT INTO books (title, sort, author_sort, timestamp, pubdate, last_modified, path, series_index, uuid)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?8)",
@@ -327,8 +317,6 @@ pub fn add_book_to_db(
     ).with_context(|| format!("Failed to insert book '{}' into database", metadata.title))?;
     let book_id = tx.last_insert_rowid();
 
-    // 3. Construct the final path and update the book record with it
-    // Matches Calibre-Web: get_valid_filename(author, chars=96) / get_valid_filename(title, chars=96) + " (" + id + ")"
     let author_dir = get_valid_filename(&metadata.author, 96);
     let title_dir = get_valid_filename(&metadata.title, 96);
     let book_path = format!("{}/{} ({})", author_dir, title_dir, book_id);
@@ -338,30 +326,18 @@ pub fn add_book_to_db(
         params![&book_path, book_id],
     ).with_context(|| format!("Failed to update path for book {}", book_id))?;
 
-    // 4. Link the book and author
     tx.execute(
         "INSERT INTO books_authors_link (book, author) VALUES (?1, ?2)",
         params![book_id, author_id],
     ).with_context(|| format!("Failed to link book {} to author {}", book_id, author_id))?;
 
-    // 5. Add the file format information to the 'data' table
-    // Determine format based on filename
-    let path_str = metadata.path.to_string_lossy();
-    let book_format = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
-        "KEPUB"
-    } else if path_str.ends_with(".epub") {
-        "EPUB"
-    } else {
-        anyhow::bail!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub")
-    };
-    // Matches Calibre-Web: get_valid_filename(title, chars=42) + ' - ' + get_valid_filename(author, chars=42)
+    let (book_format, _extension) = detect_book_format(&metadata.path)?;
     let data_name = format!("{} - {}", get_valid_filename(&metadata.title, 42), get_valid_filename(&metadata.author, 42));
     tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
         params![book_id, book_format, metadata.file_size as i64, data_name],
     )?;
 
-    // 6. Add other metadata
     let mut comment_parts = Vec::new();
     if let Some(subtitle) = &metadata.subtitle {
         comment_parts.push(format!("<h3>{}</h3>", subtitle));
@@ -381,8 +357,7 @@ pub fn add_book_to_db(
         )?;
     }
     if let Some(language) = &metadata.language {
-        let lang_id = find_or_create_language(&tx, language)?;
-
+        let lang_id = find_or_create_language(tx, language)?;
         tx.execute(
             "INSERT INTO books_languages_link (book, lang_code) VALUES (?1, ?2)",
             params![book_id, lang_id],
@@ -395,31 +370,22 @@ pub fn add_book_to_db(
         )?;
     }
 
-    // Handle publisher information
     if let Some(publisher_name) = &metadata.publisher {
-        // Get or create publisher entry
-        let publisher_id = find_or_create_by_name(&tx, "publishers", publisher_name)?;
-
-        // Link book to publisher
+        let publisher_id = find_or_create_by_name(tx, "publishers", publisher_name)?;
         tx.execute(
             "INSERT INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
             params![book_id, publisher_id],
         )?;
     }
 
-    // Handle series information
     if let Some(series_name) = &metadata.series {
-        // Get or create series entry (sort uses title_sort, matching Calibre-Web)
         let series_sort = compute_title_sort(series_name);
-        let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, &series_sort)?;
-
-        // Link book to series
+        let series_id = find_or_create_by_name_and_sort(tx, "series", series_name, &series_sort)?;
         tx.execute(
             "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
             params![book_id, series_id],
         )?;
 
-        // Set series index in books table
         if let Some(index) = metadata.series_index {
             tx.execute(
                 "UPDATE books SET series_index = ?1 WHERE id = ?2",
@@ -428,17 +394,14 @@ pub fn add_book_to_db(
         }
     }
 
-    set_metadata_dirty(&tx, book_id)?;
-
-    tx.commit()
-        .context("Failed to commit book creation transaction")?;
+    set_metadata_dirty(tx, book_id)?;
 
     Ok(UpsertResult::Created { book_id, book_path })
 }
 
 
 /// Lists all books with their attributes.
-pub fn list_books(
+pub(crate) fn list_books(
     conn: &Connection,
     appdb_conn: Option<&Connection>,
     shelf_name: Option<&str>,
@@ -607,7 +570,7 @@ pub fn list_books(
 
 
 /// Deletes a book from the database and filesystem.
-pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection>, library_db_path: &Path, book_id: i64) -> Result<()> {
+pub(crate) fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection>, library_db_path: &Path, book_id: i64) -> Result<()> {
     // Validate book ID
     validate_id(book_id, "book")?;
     
@@ -623,14 +586,14 @@ pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection
         .optional()
         .with_context(|| format!("Failed to query book with ID {}", book_id))?;
 
-    let (_title, book_path_str) = if let Some((t, p)) = book_info.as_ref() {
+    let book_path_str = if let Some((title, path)) = book_info.as_ref() {
         println!("You are about to delete:");
         println!("  ID:    {}", book_id);
-        println!("  Title: {}", t);
-        (t.clone(), p.clone())
+        println!("  Title: {}", title);
+        path.clone()
     } else {
         println!("Warning: Book with ID {} not found in Calibre database. Attempting to clean up Calibre-Web shelves and filesystem.", book_id);
-        ("(Unknown Title)".to_string(), "".to_string())
+        String::new()
     };
 
     // Delete from DB. Triggers will handle linked tables.
@@ -671,25 +634,22 @@ pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection
         // Delete cover image if it exists
         let cover_path = book_dir.join("cover.jpg");
         if cover_path.exists() {
-            std::fs::remove_file(&cover_path)
+            fs::remove_file(&cover_path)
                 .with_context(|| format!("Failed to remove cover image: {:?}", cover_path))?;
             println!(" -> Cover image deleted.");
         }
         if book_dir.exists() {
-            std::fs::remove_dir_all(&book_dir)
+            fs::remove_dir_all(&book_dir)
                 .with_context(|| format!("Failed to delete book directory: {:?}", book_dir))?;
             println!(" -> Successfully deleted book directory: {:?}", book_dir);
 
             // Check if the parent author directory is now empty
-            if let Some(author_dir) = book_dir.parent() {
-                if let Ok(mut entries) = std::fs::read_dir(author_dir) {
-                    if entries.next().is_none() {
-                        if std::fs::remove_dir(author_dir).is_ok() {
+            if let Some(author_dir) = book_dir.parent()
+                && let Ok(mut entries) = fs::read_dir(author_dir)
+                    && entries.next().is_none()
+                        && fs::remove_dir(author_dir).is_ok() {
                             println!(" -> Successfully deleted empty author directory: {:?}", author_dir);
                         }
-                    }
-                }
-            }
         } else {
             println!(
                 " -> Book directory not found, skipping filesystem delete: {:?}",
@@ -702,7 +662,6 @@ pub fn delete_book(calibre_conn: &mut Connection, appdb_conn: Option<&Connection
     Ok(())
 }
 
-/// Creates Calibre-specific custom SQL functions needed by the database triggers.
 /// Helper function to get linked items like authors, tags, etc. for a book.
 fn get_linked_items(
     conn: &Connection,
@@ -728,18 +687,6 @@ fn get_linked_items(
         .with_context(|| format!("Failed to prepare query for {}", item_table))?;
     let items_iter = stmt.query_map(params![book_id], |row| row.get(0))?;
     items_iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-}
-
-/// Generates a sortable author name, delegating to the shared implementation
-/// that matches Calibre-Web's `get_sorted_author()`.
-fn get_author_sort_value(author: &str) -> String {
-    get_sorted_author(author)
-}
-
-/// Generates a sortable title, delegating to the shared implementation
-/// that matches Calibre-Web's `title_sort()` with the default regex.
-fn get_title_sort(title: &str) -> String {
-    compute_title_sort(title)
 }
 
 /// Helper function to get the language of a book.

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::utils::now_utc_micro;
 
 /// Cleans up orphaned data in both Calibre and Calibre-Web databases
-pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut Connection>, calibre_library_path: &PathBuf) -> Result<()> {
+pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut Connection>, calibre_library_path: &PathBuf) -> Result<()> {
     println!("🧹 Starting database cleanup...");
     
     // Get list of actual files in the Calibre library
@@ -17,19 +17,18 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
         .into_iter()
         .filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(relative_path) = path.strip_prefix(calibre_library_path).ok() {
+            if path.is_file()
+                && let Ok(relative_path) = path.strip_prefix(calibre_library_path) {
                     existing_files.insert(relative_path.to_path_buf());
                     // Store the immediate parent directory if it contains a book file
-                    if let Some(parent) = relative_path.parent() {
-                        if let Some(ext) = relative_path.extension() {
-                            if ext != "jpg" && ext != "opf" {  // Ignore cover images and metadata files
+                    if let Some(parent) = relative_path.parent()
+                        && let Some(ext) = relative_path.extension() {
+                            let ext_lower = ext.to_ascii_lowercase();
+                            if ext_lower != "jpg" && ext_lower != "opf" {
                                 book_paths.insert(parent.to_path_buf());
                             }
                         }
-                    }
                 }
-            }
     }
 
     // Start transaction for metadata DB cleanup
@@ -214,10 +213,10 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
 
         // Clean up Kobo bookmarks before reading state
         let deleted = tx.execute(
-            "DELETE FROM kobo_bookmark WHERE kobo_reading_state_id IN (
-                SELECT id FROM kobo_reading_state WHERE book_id NOT IN (?)
-            )",
-            params![valid_book_ids],
+            &format!("DELETE FROM kobo_bookmark WHERE kobo_reading_state_id IN (
+                SELECT id FROM kobo_reading_state WHERE book_id NOT IN ({})
+            )", valid_book_ids),
+            [],
         )?;
         if deleted > 0 {
             println!(" -> Removed {} orphaned Kobo bookmark entries", deleted);
@@ -225,10 +224,10 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
 
         // Clean up Kobo statistics before reading state
         let deleted = tx.execute(
-            "DELETE FROM kobo_statistics WHERE kobo_reading_state_id IN (
-                SELECT id FROM kobo_reading_state WHERE book_id NOT IN (?)
-            )",
-            params![valid_book_ids],
+            &format!("DELETE FROM kobo_statistics WHERE kobo_reading_state_id IN (
+                SELECT id FROM kobo_reading_state WHERE book_id NOT IN ({})
+            )", valid_book_ids),
+            [],
         )?;
         if deleted > 0 {
             println!(" -> Removed {} orphaned Kobo statistics entries", deleted);

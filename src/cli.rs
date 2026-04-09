@@ -45,7 +45,7 @@ pub enum Commands {
         #[clap(long)]
         shelf: Option<String>,
         /// Show only books that aren't on any shelf
-        #[clap(long)]
+        #[clap(long, conflicts_with = "shelf")]
         unshelved: bool,
         /// List all attributes for each book.
         #[clap(long)]

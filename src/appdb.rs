@@ -5,13 +5,13 @@ use uuid::Uuid;
 use crate::utils::{now_utc_micro, validate_id};
 
 /// Opens the app.db connection if a path is provided.
-pub fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
-    path.map(|appdb_path| crate::db::open_appdb(appdb_path))
+pub(crate) fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
+    path.map(crate::db::open_appdb)
         .transpose()
 }
 
 /// Lists all unique shelves from the Calibre-Web app.db.
-pub fn list_shelves(appdb_conn: Option<&Connection>) -> Result<()> {
+pub(crate) fn list_shelves(appdb_conn: Option<&Connection>) -> Result<()> {
     if let Some(conn) = appdb_conn {
         println!("📖 Finding available shelves from Calibre-Web...");
 
@@ -97,7 +97,7 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
 }
 
 /// Ensures complete Kobo sync setup for a book: reading state, statistics, bookmark, and book_read_link.
-/// This function contains the common logic shared between add_book_to_shelf_core and fix_kobo_sync_issues.
+/// Called by `fix_kobo_sync_issues` to repair incomplete sync records.
 fn ensure_kobo_sync_setup(tx: &Transaction, book_id: i64, user_id: i64, timestamp: &str) -> Result<()> {
     // Check if reading state already exists
     let reading_state_id: Option<i64> = tx.query_row(
@@ -258,7 +258,7 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
 }
 
 /// Adds a book to a shelf in the Calibre-Web database. Creates the shelf if it doesn't exist.
-pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
+pub(crate) fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
     let was_added = add_book_to_shelf_core(conn, book_id, shelf_name, username, true)?;
     
     if was_added {
@@ -269,7 +269,7 @@ pub fn add_book_to_shelf_in_appdb(conn: &mut Connection, book_id: i64, shelf_nam
 }
 
 /// Inspects the database contents, showing relationships between books and shelves
-pub fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connection) -> Result<()> {
+pub(crate) fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connection) -> Result<()> {
     println!("\n📚 Database Inspection Report");
     println!("═════════════════════════");
 
@@ -388,7 +388,7 @@ pub fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connect
         )?;
         
         let orphaned_books: Vec<i64> = orphaned_stmt.query_map(params![], |row| {
-            Ok(row.get::<_, i64>("book_id")?)
+            row.get::<_, i64>("book_id")
         })?.collect::<Result<Vec<_>, _>>()?;
 
         if !orphaned_books.is_empty() {
@@ -404,7 +404,7 @@ pub fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connect
                 .collect();
             
             let existing_books: std::collections::HashSet<i64> = cal_stmt.query_map(&params_vec[..], |row| {
-                Ok(row.get::<_, i64>("id")?)
+                row.get::<_, i64>("id")
             })?.collect::<Result<_, _>>()?;
 
             let missing_books: Vec<_> = orphaned_books.iter()
@@ -425,51 +425,76 @@ pub fn inspect_databases(appdb_conn: Option<&Connection>, calibre_conn: &Connect
     Ok(())
 }
 
-pub fn clean_empty_shelves(appdb_conn: &Connection, calibre_conn: &Connection) -> Result<()> {
+pub(crate) fn clean_empty_shelves(appdb_conn: &mut Connection, calibre_conn: &Connection) -> Result<()> {
     println!("🧹 Cleaning empty shelves from Calibre-Web...");
 
     let mut calibre_check_stmt = calibre_conn.prepare("SELECT 1 FROM books WHERE id = ?1")
         .context("Failed to prepare book existence check query")?;
 
-    let mut stmt = appdb_conn.prepare("SELECT id, name FROM shelf")
-        .context("Failed to prepare shelf query")?;
-    let shelf_iter = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
+    // Collect shelf data up-front so the borrow on appdb_conn is released before the transaction
+    let shelves: Vec<(i64, String)> = {
+        let mut stmt = appdb_conn.prepare("SELECT id, name FROM shelf")
+            .context("Failed to prepare shelf query")?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?.collect::<Result<Vec<_>, _>>()?
+    };
 
-    for shelf_result in shelf_iter {
-        let (shelf_id, shelf_name) = shelf_result?;
+    // Collect all orphaned link IDs and empty shelf IDs before mutating
+    let mut orphan_link_ids: Vec<(i64, String)> = Vec::new();
+    let mut empty_shelf_ids: Vec<(i64, String)> = Vec::new();
 
-        // Select the link's primary key and the book_id
-        let mut link_stmt = appdb_conn.prepare("SELECT id, book_id FROM book_shelf_link WHERE shelf = ?1")?;
-        let book_link_iter = link_stmt.query_map(params![shelf_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?;
+    for (shelf_id, shelf_name) in &shelves {
+        let links: Vec<(i64, i64)> = {
+            let mut link_stmt = appdb_conn.prepare("SELECT id, book_id FROM book_shelf_link WHERE shelf = ?1")?;
+            link_stmt.query_map(params![shelf_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        };
 
-        let mut orphaned_links_found = 0;
-        for book_link_result in book_link_iter {
-            let (link_id, book_id) = book_link_result?;
-            
+        let mut orphaned_count = 0;
+        for (link_id, book_id) in links {
             let exists: bool = calibre_check_stmt.query_row(params![book_id], |_| Ok(true)).optional()?.is_some();
-            
             if !exists {
-                // Delete the specific orphan link by its own id
-                appdb_conn.execute("DELETE FROM book_shelf_link WHERE id = ?1", params![link_id])?;
-                orphaned_links_found += 1;
+                orphan_link_ids.push((link_id, shelf_name.clone()));
+                orphaned_count += 1;
             }
         }
 
-        if orphaned_links_found > 0 {
-            println!(" -> Found and removed {} orphaned book links for shelf '{}'.", orphaned_links_found, shelf_name);
+        if orphaned_count > 0 {
+            println!(" -> Found {} orphaned book links for shelf '{}'.", orphaned_count, shelf_name);
         }
+    }
 
-        // After cleaning orphans, check if the shelf is now empty
-        let count: i64 = appdb_conn.query_row("SELECT COUNT(*) FROM book_shelf_link WHERE shelf = ?1", params![shelf_id], |row| row.get(0))?;
+    // Now perform all deletes inside a single transaction
+    let tx = appdb_conn.transaction()
+        .context("Failed to start shelf cleanup transaction")?;
 
+    for (link_id, _shelf_name) in &orphan_link_ids {
+        tx.execute("DELETE FROM book_shelf_link WHERE id = ?1", params![link_id])?;
+    }
+
+    if !orphan_link_ids.is_empty() {
+        println!(" -> Removed {} orphaned book links.", orphan_link_ids.len());
+    }
+
+    for (shelf_id, shelf_name) in &shelves {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM book_shelf_link WHERE shelf = ?1",
+            params![shelf_id],
+            |row| row.get(0),
+        )?;
         if count == 0 {
-            appdb_conn.execute("DELETE FROM shelf WHERE id = ?1", params![shelf_id])?;
-            println!(" -> Removed empty shelf '{}'.", shelf_name);
+            tx.execute("DELETE FROM shelf WHERE id = ?1", params![shelf_id])?;
+            empty_shelf_ids.push((*shelf_id, shelf_name.clone()));
         }
+    }
+
+    tx.commit()
+        .context("Failed to commit shelf cleanup transaction")?;
+
+    for (_id, name) in &empty_shelf_ids {
+        println!(" -> Removed empty shelf '{}'.", name);
     }
 
     println!("✅ Shelf cleaning complete.");
@@ -477,7 +502,7 @@ pub fn clean_empty_shelves(appdb_conn: &Connection, calibre_conn: &Connection) -
 }
 
 /// Diagnoses and fixes Kobo sync issues for existing shelf links
-pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
+pub(crate) fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     println!("🔧 Diagnosing and fixing Kobo sync issues...");
     
     // Create backup before making changes
@@ -582,7 +607,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
         tx.execute(
             "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) 
              VALUES (?1, ?2, NULL, NULL)",
-            [reading_state_id.to_string(), timestamp],
+            params![reading_state_id, timestamp],
         )?;
         
         println!(" -> Created kobo_statistics entry for book {} (reading_state_id: {})", book_id, reading_state_id);
@@ -625,8 +650,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
 /// Fixes schema issues and data problems in kobo_reading_state and kobo_bookmark tables
 fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
     // Check if current_bookmark column exists
-    let has_current_bookmark: bool = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kobo_reading_state'")
-        .unwrap()
+    let has_current_bookmark: bool = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kobo_reading_state'")?
         .query_row([], |row| {
             let sql: String = row.get(0)?;
             Ok(sql.contains("current_bookmark"))
@@ -657,8 +681,7 @@ fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
          WHERE krs.id NOT IN (
              SELECT MAX(id) FROM kobo_reading_state GROUP BY user_id, book_id
          )"
-    )?.query_map([], |row| Ok(row.get::<_, i64>(0)?))
-     .unwrap()
+    )?.query_map([], |row| row.get::<_, i64>(0))?
      .collect::<Result<Vec<_>, _>>()?;
     
     // Delete any bookmarks associated with duplicate reading states first
@@ -686,8 +709,7 @@ fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
         "SELECT krs.id FROM kobo_reading_state krs 
          LEFT JOIN kobo_bookmark kb ON krs.id = kb.kobo_reading_state_id 
          WHERE kb.id IS NULL"
-    )?.query_map([], |row| Ok(row.get::<_, i64>(0)?))
-     .unwrap()
+    )?.query_map([], |row| row.get::<_, i64>(0))?
      .collect::<Result<Vec<_>, _>>()?;
     
     let current_time = now_utc_micro();
@@ -733,9 +755,9 @@ fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
 }
 
 /// Provides detailed diagnostics for Kobo sync setup
-pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let appdb_conn = Connection::open(appdb_path)?;
-    let calibre_conn = Connection::open(metadata_path)?;
+pub(crate) fn diagnose_kobo_sync(appdb_path: &Path, metadata_path: &Path) -> Result<()> {
+    let appdb_conn = crate::db::open_appdb(appdb_path)?;
+    let calibre_conn = crate::db::open_calibre_db(metadata_path)?;
     println!("🔍 Kobo Sync Diagnostic Report");
     println!("═══════════════════════════════");
     
@@ -775,7 +797,7 @@ pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), B
         Ok((
             row.get::<_, i64>("id")?,
             row.get::<_, String>("name")?,
-            row.get::<_, String>("username")?,
+            row.get::<_, Option<String>>("username")?,
             row.get::<_, String>("created")?,
             row.get::<_, String>("last_modified")?,
             row.get::<_, i64>("book_count")?,
@@ -784,6 +806,7 @@ pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), B
     
     for shelf_result in shelf_rows {
         let (shelf_id, shelf_name, username, created, last_modified, book_count) = shelf_result?;
+        let username = username.unwrap_or_else(|| "Unknown".to_string());
         println!("  - {} (ID: {}) - Owner: {} - Books: {}", shelf_name, shelf_id, username, book_count);
         println!("    Created: {} | Last Modified: {}", created, last_modified);
         
@@ -849,7 +872,7 @@ pub fn diagnose_kobo_sync(appdb_path: &str, metadata_path: &str) -> Result<(), B
 
 /// Adds an existing book to a shelf in the Calibre-Web database (like Calibre-Web does).
 /// This function only operates on app.db and assumes the book already exists in metadata.db.
-pub fn add_existing_book_to_shelf(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
+pub(crate) fn add_existing_book_to_shelf(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>) -> Result<()> {
     // Validate book ID
     validate_id(book_id, "book")
         .context("Cannot add book to shelf: invalid book ID")?;

@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use crate::models::BookMetadata;
-use crate::utils::get_valid_filename;
+use crate::utils::{get_valid_filename, detect_book_format};
 
 /// Maximum cover image size in bytes (200KB)
 const MAX_COVER_SIZE: u64 = 200 * 1024;
@@ -93,7 +93,7 @@ fn resize_cover_if_needed(cover_data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Extracts full metadata from the EPUB file.
-pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
+pub(crate) fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
     let doc = epub::doc::EpubDoc::new(path)?;
     let title = doc
         .mdata("title")
@@ -167,7 +167,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
             if id.starts_with("urn:isbn:") {
                 return Some(id.trim_start_matches("urn:isbn:").to_string());
             }
-            let digits: String = id.chars().filter(|c| c.is_digit(10)).collect();
+            let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.len() == 10 || digits.len() == 13 {
                 return Some(digits);
             }
@@ -214,15 +214,13 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
             }
             
             // Try year only
-            if let Ok(year) = date_str.parse::<i32>() {
-                return Some(DateTime::<Utc>::from_naive_utc_and_offset(
-                    chrono::NaiveDate::from_ymd_opt(year, 1, 1)
-                        .unwrap()
-                        .and_hms_opt(0, 0, 0)
-                        .unwrap(),
-                    Utc,
-                ));
-            }
+            if let Ok(year) = date_str.parse::<i32>()
+                && let Some(date) = chrono::NaiveDate::from_ymd_opt(year, 1, 1) {
+                    return Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                        date.and_hms_opt(0, 0, 0).expect("midnight is always valid"),
+                        Utc,
+                    ));
+                }
             
             None
         });
@@ -260,14 +258,14 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
                 .and_then(|i| {
                     let rest = &title.value[i + 1..];
                     let num_str: String = rest.chars()
-                        .take_while(|c| c.is_digit(10) || *c == '.')
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
                         .collect();
                     num_str.parse::<f64>().ok()
                 })
         });
 
     // Get the file size
-    let file_size = std::fs::metadata(path)
+    let file_size = fs::metadata(path)
         .with_context(|| format!("Failed to get file size for {:?}", path))?
         .len();
 
@@ -291,7 +289,7 @@ pub fn get_epub_metadata(path: &Path) -> Result<BookMetadata> {
 /// Copies or updates the EPUB file in the Calibre library structure.
 /// If updating, it first clears the destination directory of old files.
 /// Returns true if a cover was saved.
-pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, is_update: bool) -> Result<bool> {
+pub(crate) fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, is_update: bool, metadata: &BookMetadata) -> Result<bool> {
     let dest_dir = library_dir.join(book_path);
     let mut cover_saved = false;
 
@@ -310,20 +308,8 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
     fs::create_dir_all(&dest_dir)
         .with_context(|| format!("Failed to create directory: {:?}", dest_dir))?;
 
-    // Read the metadata to get title and author for the filename
-    let metadata = get_epub_metadata(epub_file)?;
+    let (_format, extension) = detect_book_format(epub_file)?;
 
-    // Validate and determine extension
-    let path_str = epub_file.to_string_lossy();
-    let extension = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
-        ".kepub"
-    } else if path_str.ends_with(".epub") {
-        ".epub"
-    } else {
-        return Err(anyhow::anyhow!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub"))
-    };
-
-    // Matches Calibre-Web: get_valid_filename(title, chars=42) + ' - ' + get_valid_filename(author, chars=42) + ext
     let epub_filename = format!("{} - {}{}", get_valid_filename(&metadata.title, 42), get_valid_filename(&metadata.author, 42), extension);
     let dest_file = dest_dir.join(epub_filename);
     fs::copy(epub_file, &dest_file)
@@ -341,7 +327,7 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
                         cover_data.clone()
                     });
                 
-                std::fs::write(&cover_dest, &final_cover_data)
+                fs::write(&cover_dest, &final_cover_data)
                     .with_context(|| format!("Failed to write cover image to {:?}", cover_dest))?;
                 println!(" -> Cover image extracted from EPUB and saved.");
                 cover_saved = true;
@@ -360,7 +346,7 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
                             cover_data
                         });
                     
-                    std::fs::write(&cover_dest, &final_cover_data)
+                    fs::write(&cover_dest, &final_cover_data)
                         .with_context(|| format!("Failed to write cover image to {:?}", cover_dest))?;
                     println!(" -> Cover image copied from external file and resized if needed.");
                     cover_saved = true;

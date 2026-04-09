@@ -3,9 +3,9 @@ use rusqlite::Connection;
 use std::path::Path;
 
 /// Configuration for database connections
-pub struct DatabaseConfig {
-    pub enable_foreign_keys: bool,
-    pub busy_timeout_ms: u32,
+pub(crate) struct DatabaseConfig {
+    pub(crate) enable_foreign_keys: bool,
+    pub(crate) busy_timeout_ms: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -18,7 +18,7 @@ impl Default for DatabaseConfig {
 }
 
 /// Opens a database connection with standard configuration
-pub fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Connection> {
+pub(crate) fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Connection> {
     if !path.exists() {
         anyhow::bail!("Database file does not exist: {:?}", path);
     }
@@ -40,7 +40,7 @@ pub fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Connectio
 }
 
 /// Opens the Calibre metadata.db connection
-pub fn open_calibre_db(path: &Path) -> Result<Connection> {
+pub(crate) fn open_calibre_db(path: &Path) -> Result<Connection> {
     let config = DatabaseConfig::default();
     let conn = open_connection(path, &config)?;
     
@@ -51,7 +51,7 @@ pub fn open_calibre_db(path: &Path) -> Result<Connection> {
 }
 
 /// Opens the Calibre-Web app.db connection
-pub fn open_appdb(path: &Path) -> Result<Connection> {
+pub(crate) fn open_appdb(path: &Path) -> Result<Connection> {
     let config = DatabaseConfig::default();
     open_connection(path, &config)
 }

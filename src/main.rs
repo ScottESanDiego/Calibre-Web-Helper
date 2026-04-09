@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rusqlite::{Connection, params};
+use std::fs;
 use std::path::Path;
 
 mod cli;
@@ -12,6 +13,10 @@ mod epub;
 mod calibre;
 mod cleanup;
 mod utils;
+
+fn library_dir(metadata_file: &Path) -> &Path {
+    metadata_file.parent().unwrap_or_else(|| Path::new("."))
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -26,14 +31,13 @@ fn main() -> Result<()> {
     };
 
     // Validate library database file path for commands that need it
-    if let Some(ref metadata_file) = metadata_file {
-        if !metadata_file.exists() {
+    if let Some(ref metadata_file) = metadata_file
+        && !metadata_file.exists() {
             anyhow::bail!(
                 "The specified library database file does not exist: {:?}",
                 metadata_file
             );
         }
-    }
 
     let mut calibre_conn = if let Some(ref metadata_file) = metadata_file {
         let conn = db::open_calibre_db(metadata_file)
@@ -92,14 +96,13 @@ fn main() -> Result<()> {
         }
         Commands::CleanShelves => {
             let calibre_conn = calibre_conn.as_ref().context("--metadata-file is required for clean-shelves command")?;
-            if let Some(conn) = appdb_conn {
-                // Create backup before cleaning shelves
+            if let Some(ref mut conn) = appdb_conn {
                 if let Some(ref appdb_path) = cli.appdb_file {
                     println!("📦 Creating app.db backup before cleaning shelves...");
                     crate::utils::backup_database(appdb_path, "clean_shelves")
                         .context("Failed to backup app.db")?;
                 }
-                appdb::clean_empty_shelves(&conn, calibre_conn)?;
+                appdb::clean_empty_shelves(conn, calibre_conn)?;
             }
         }
         Commands::InspectDb => {
@@ -120,7 +123,7 @@ fn main() -> Result<()> {
                     .context("Failed to backup app.db")?;
             }
             
-            cleanup::cleanup_databases(calibre_conn, appdb_conn.as_mut(), &metadata_file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf())?;
+            cleanup::cleanup_databases(calibre_conn, appdb_conn.as_mut(), &library_dir(metadata_file).to_path_buf())?;
         }
         Commands::FixKoboSync => {
             if let Some(mut conn) = appdb_conn {
@@ -139,8 +142,7 @@ fn main() -> Result<()> {
             let metadata_path = metadata_file.as_ref().context("metadata-file is required")?;
             let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
             
-            appdb::diagnose_kobo_sync(appdb_path.to_str().unwrap(), metadata_path.to_str().unwrap())
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            appdb::diagnose_kobo_sync(appdb_path, metadata_path)?;
         }
         Commands::AddToShelf { book_id, shelf, username } => {
             let appdb_path = cli.appdb_file.as_ref().context("appdb-file is required")?;
@@ -195,8 +197,7 @@ fn add_book_flow(
     }
 
     println!("✒️ Writing to Calibre database...");
-    let library_dir = library_db_path.parent().unwrap_or_else(|| Path::new("."));
-    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir, epub_file, dry_run)?;
+    let upsert_result = calibre::add_book_to_db(calibre_conn, &metadata, library_dir(library_db_path), epub_file, dry_run)?;
 
     let book_id = upsert_result.book_id();
     let book_path = upsert_result.book_path().to_string();
@@ -227,7 +228,7 @@ fn add_book_flow(
 
     if !skip_file_operations && !dry_run {
         println!("🚚 Updating files in library...");
-        let cover_saved = epub::update_book_files(library_db_path.parent().unwrap_or_else(|| Path::new(".")), epub_file, &book_path, is_update)?;
+        let cover_saved = epub::update_book_files(library_dir(library_db_path), epub_file, &book_path, is_update, &metadata)?;
         println!(" -> File copied successfully.");
 
         if cover_saved {
@@ -305,18 +306,17 @@ fn add_directory_flow(
     
     // Find all EPUB files in the directory
     let mut epub_files = Vec::new();
-    for entry in std::fs::read_dir(epub_dir)? {
+    for entry in fs::read_dir(epub_dir)? {
         let entry = entry?;
         let path = entry.path();
         
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
+        if path.is_file()
+            && let Some(extension) = path.extension() {
                 let ext_str = extension.to_string_lossy().to_lowercase();
                 if ext_str == "epub" || ext_str == "kepub" {
                     epub_files.push(path);
                 }
             }
-        }
     }
     
     if epub_files.is_empty() {
