@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use uuid::Uuid;
 use crate::models::{BookMetadata, ExistingBookData, UpdateChanges, UpsertResult};
-use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash, validate_id, validate_table_name, validate_column_name};
+use crate::utils::{now_utc_micro, format_timestamp_micro, find_or_create_by_name, find_or_create_by_name_and_sort, find_or_create_language, calculate_file_hash, validate_id, validate_table_name, validate_column_name, get_valid_filename, title_sort as compute_title_sort, get_sorted_author, set_metadata_dirty};
 
 /// Retrieves existing book metadata for comparison
 fn get_existing_book_data(tx: &Connection, book_id: i64) -> Result<ExistingBookData> {
@@ -129,7 +129,7 @@ pub fn add_book_to_db(
         .context("Failed to start database transaction")?;
 
     // Check for an existing book by title and author sort key.
-    let author_sort_name = get_author_sort(&metadata.author);
+    let author_sort_name = get_author_sort_value(&metadata.author);
     let existing_book: Option<(i64, String)> = tx.query_row(
         "SELECT id, path FROM books WHERE title = ?1 AND author_sort = ?2",
         params![&metadata.title, &author_sort_name],
@@ -258,7 +258,8 @@ pub fn add_book_to_db(
             ).with_context(|| format!("Failed to delete old series link for book {}", book_id))?;
 
             if let Some(series_name) = &metadata.series {
-                let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)
+                let series_sort = compute_title_sort(series_name);
+            let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, &series_sort)
                     .with_context(|| format!("Failed to find or create series '{}'", series_name))?;
                 tx.execute(
                     "INSERT INTO books_series_link (book, series) VALUES (?1, ?2)",
@@ -269,6 +270,8 @@ pub fn add_book_to_db(
                 ))?;
             }
         }
+
+        set_metadata_dirty(&tx, book_id)?;
 
         tx.commit()
             .context("Failed to commit book update transaction")?;
@@ -287,11 +290,12 @@ pub fn add_book_to_db(
         }
         println!("   [DRY RUN] Would create new database entry and copy files");
         tx.commit()?;
-        // Return a fake book_id and path for dry-run
-        return Ok(UpsertResult::Created { book_id: 0, book_path: format!("{}/{} (NEW)", metadata.author, metadata.title) });
+        let dry_author = get_valid_filename(&metadata.author, 96);
+        let dry_title = get_valid_filename(&metadata.title, 96);
+        return Ok(UpsertResult::Created { book_id: 0, book_path: format!("{}/{} (NEW)", dry_author, dry_title) });
     }
     
-    let author_sort_name = get_author_sort(&metadata.author);
+    let author_sort_name = get_author_sort_value(&metadata.author);
     let author_id = find_or_create_by_name_and_sort(&tx, "authors", &metadata.author, &author_sort_name)
         .with_context(|| format!("Failed to find or create author '{}'", metadata.author))?;
 
@@ -324,7 +328,10 @@ pub fn add_book_to_db(
     let book_id = tx.last_insert_rowid();
 
     // 3. Construct the final path and update the book record with it
-    let book_path = format!("{}/{} ({})", metadata.author, metadata.title, book_id);
+    // Matches Calibre-Web: get_valid_filename(author, chars=96) / get_valid_filename(title, chars=96) + " (" + id + ")"
+    let author_dir = get_valid_filename(&metadata.author, 96);
+    let title_dir = get_valid_filename(&metadata.title, 96);
+    let book_path = format!("{}/{} ({})", author_dir, title_dir, book_id);
 
     tx.execute(
         "UPDATE books SET path = ?1 WHERE id = ?2",
@@ -340,15 +347,18 @@ pub fn add_book_to_db(
     // 5. Add the file format information to the 'data' table
     // Determine format based on filename
     let path_str = metadata.path.to_string_lossy();
-    let (format, filename) = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
-        ("KEPUB", format!("{} - {}", metadata.title, metadata.author))
+    let book_format = if path_str.ends_with(".kepub.epub") || path_str.ends_with(".kepub") {
+        "KEPUB"
     } else if path_str.ends_with(".epub") {
-        ("EPUB", format!("{} - {}", metadata.title, metadata.author))
+        "EPUB"
     } else {
         anyhow::bail!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub")
-    };    tx.execute(
+    };
+    // Matches Calibre-Web: get_valid_filename(title, chars=42) + ' - ' + get_valid_filename(author, chars=42)
+    let data_name = format!("{} - {}", get_valid_filename(&metadata.title, 42), get_valid_filename(&metadata.author, 42));
+    tx.execute(
         "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-        params![book_id, format, metadata.file_size, filename],
+        params![book_id, book_format, metadata.file_size as i64, data_name],
     )?;
 
     // 6. Add other metadata
@@ -399,8 +409,9 @@ pub fn add_book_to_db(
 
     // Handle series information
     if let Some(series_name) = &metadata.series {
-        // Get or create series entry
-        let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, series_name)?;
+        // Get or create series entry (sort uses title_sort, matching Calibre-Web)
+        let series_sort = compute_title_sort(series_name);
+        let series_id = find_or_create_by_name_and_sort(&tx, "series", series_name, &series_sort)?;
 
         // Link book to series
         tx.execute(
@@ -416,6 +427,8 @@ pub fn add_book_to_db(
             )?;
         }
     }
+
+    set_metadata_dirty(&tx, book_id)?;
 
     tx.commit()
         .context("Failed to commit book creation transaction")?;
@@ -717,58 +730,16 @@ fn get_linked_items(
     items_iter.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Generates a sortable author name (e.g., "John Doe" -> "Doe, John").
-/// This is a simplified version of Calibre's logic.
-fn get_author_sort(author: &str) -> String {
-    let author = author.trim();
-    
-    // Handle names with prefixes like "Jr.", "Sr.", "III", etc.
-    let parts: Vec<&str> = author.split_whitespace().collect();
-    
-    if parts.len() > 1 {
-        // Check for common suffixes that should stay with the last name
-        let suffixes = ["Jr.", "Sr.", "II", "III", "IV", "Jr", "Sr"];
-        
-        let mut last_name_parts = vec![parts[parts.len() - 1]];
-        let mut first_name_end = parts.len() - 1;
-        
-        // Check if the second-to-last part is a suffix
-        if parts.len() > 2 {
-            let second_last = parts[parts.len() - 2];
-            if suffixes.iter().any(|&suffix| second_last.eq_ignore_ascii_case(suffix)) {
-                last_name_parts.insert(0, second_last);
-                first_name_end = parts.len() - 2;
-            }
-        }
-        
-        let last_name = last_name_parts.join(" ");
-        let first_name = parts[..first_name_end].join(" ");
-        
-        if first_name.is_empty() {
-            last_name
-        } else {
-            format!("{}, {}", last_name, first_name)
-        }
-    } else {
-        author.to_string()
-    }
+/// Generates a sortable author name, delegating to the shared implementation
+/// that matches Calibre-Web's `get_sorted_author()`.
+fn get_author_sort_value(author: &str) -> String {
+    get_sorted_author(author)
 }
 
+/// Generates a sortable title, delegating to the shared implementation
+/// that matches Calibre-Web's `title_sort()` with the default regex.
 fn get_title_sort(title: &str) -> String {
-    let title = title.trim();
-    
-    // Remove common articles from the beginning for proper sorting
-    let articles = ["The ", "A ", "An "];
-    
-    for article in articles {
-        if title.len() > article.len() && title.starts_with(article) {
-            // Move article to the end
-            let rest = &title[article.len()..];
-            return format!("{}, {}", rest, article.trim());
-        }
-    }
-    
-    title.to_string()
+    compute_title_sort(title)
 }
 
 /// Helper function to get the language of a book.

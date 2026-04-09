@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
-use crate::utils::now_local_micro;
+use crate::utils::now_utc_micro;
 
 /// Cleans up orphaned data in both Calibre and Calibre-Web databases
 pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut Connection>, calibre_library_path: &PathBuf) -> Result<()> {
@@ -148,7 +148,7 @@ pub fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut
         }
 
         // Set both timestamps to current time if both are NULL
-        let now_micro = now_local_micro();
+        let now_micro = now_utc_micro();
         let fixed = tx.execute(
             "UPDATE shelf SET created = ?, last_modified = ? WHERE created IS NULL AND last_modified IS NULL",
             params![now_micro, now_micro],

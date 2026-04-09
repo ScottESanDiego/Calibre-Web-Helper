@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 use uuid::Uuid;
-use crate::utils::{now_local_micro, now_utc_micro, validate_id};
+use crate::utils::{now_utc_micro, validate_id};
 
 /// Opens the app.db connection if a path is provided.
 pub fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
@@ -81,10 +81,9 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
         Some(id) => Ok(id),
         None => {
             // Shelf doesn't exist, create it for the specific user
-            // Generate UUID and set kobo_sync to match Calibre-Web behavior
-            // Use microsecond precision like Calibre-Web
+            // Matches Calibre-Web: Shelf() uses datetime.now(timezone.utc) for created/last_modified
             let uuid = Uuid::new_v4().to_string();
-            let now_micro = now_local_micro();
+            let now_micro = now_utc_micro();
             
             tx.execute(
                 "INSERT INTO shelf (uuid, name, is_public, user_id, kobo_sync, created, last_modified) VALUES (?1, ?2, 0, ?3, 0, ?4, ?5)",
@@ -191,9 +190,10 @@ fn sync_kobo_shelf_timestamps(tx: &Transaction, timestamp: &str) -> Result<usize
     Ok(updated_books)
 }
 
-/// Core function to add a book to a shelf with duplicate handling control
+/// Core function to add a book to a shelf with duplicate handling control.
+/// Matches Calibre-Web's `add_to_shelf()` behavior: insert BookShelf row,
+/// update shelf.last_modified. No proactive Kobo sync record creation.
 fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str, username: Option<&str>, allow_duplicates: bool) -> Result<bool> {
-    // Validate inputs
     validate_id(book_id, "book")
         .context("Invalid book ID for shelf operation")?;
     
@@ -228,18 +228,17 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
             println!(" -> Book {} is already on shelf '{}'.", book_id, shelf_name);
         }
         tx.commit()?;
-        return Ok(false); // No new link was created
+        return Ok(false);
     }
 
-    // Get the next order value for this shelf
+    // Get the next order value for this shelf (matches Calibre-Web's max(order) + 1 logic)
     let next_order: i64 = tx.query_row(
         "SELECT COALESCE(MAX(\"order\"), 0) + 1 FROM book_shelf_link WHERE shelf = ?1",
         params![shelf_id],
         |row| row.get(0)
     )?;
 
-    // Link the book to the shelf
-    // Use UTC time and add a small offset to ensure it's newer than any existing sync tokens
+    // Insert the book-shelf link with UTC timestamp (matches Calibre-Web's datetime.now(timezone.utc))
     let now_micro = now_utc_micro();
     
     tx.execute(
@@ -247,54 +246,15 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
         params![book_id, shelf_id, next_order, &now_micro]
     )?;
 
-    // Update the shelf's last_modified timestamp
+    // Update the shelf's last_modified timestamp (matches Calibre-Web's shelf.last_modified = datetime.now(timezone.utc))
     tx.execute(
         "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
         params![&now_micro, shelf_id],
     )?;
 
-    // Always create complete Kobo sync setup for books regardless of shelf sync setting
-    // This ensures books have proper sync state even if shelf sync is disabled
-    ensure_kobo_sync_setup(&tx, book_id, user_id, &now_micro)?;
-    println!(" -> Ensured complete Kobo sync setup (reading state, statistics, bookmark, book_read_link)");
-    
-    // Clear stale kobo_synced_books entries for books that are no longer on any kobo-sync shelf
-    // Only remove entries for books that aren't on any kobo-enabled shelves for this user
-    let cleared_entries = tx.execute(
-        "DELETE FROM kobo_synced_books 
-         WHERE user_id = ?1 
-         AND book_id NOT IN (
-            SELECT DISTINCT bsl.book_id 
-            FROM book_shelf_link bsl 
-            JOIN shelf s ON bsl.shelf = s.id 
-            WHERE s.user_id = ?1 AND s.kobo_sync = 1
-         )",
-        params![user_id],
-    )?;
-    
-    if cleared_entries > 0 {
-        println!(" -> Cleared {} stale sync entries for books no longer on kobo shelves", cleared_entries);
-    }
-    
-    // Check if the current shelf is a Kobo sync shelf, and if so, update timestamps for all books
-    let is_kobo_shelf: bool = tx.query_row(
-        "SELECT kobo_sync FROM shelf WHERE id = ?1",
-        params![shelf_id],
-        |row| row.get(0)
-    )?;
-    
-    if is_kobo_shelf {
-        // Update timestamps for ALL books on Kobo shelves to ensure they sync together
-        let updated_books = sync_kobo_shelf_timestamps(&tx, &now_micro)?;
-        
-        if updated_books > 0 {
-            println!(" -> Updated timestamps for {} existing books on Kobo shelf to ensure consistent sync", updated_books);
-        }
-    }
-
     tx.commit()
         .context("Failed to commit shelf link transaction")?;
-    Ok(true) // New link was created
+    Ok(true)
 }
 
 /// Adds a book to a shelf in the Calibre-Web database. Creates the shelf if it doesn't exist.
@@ -552,7 +512,7 @@ pub fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
     
     for (book_id, shelf_id, user_id, username) in books_to_process {
         let username = username.unwrap_or_else(|| "unknown".to_string());
-        let now_micro = now_local_micro();
+        let now_micro = now_utc_micro();
         
         // Use the shared function to ensure complete Kobo sync setup
         // This handles reading state, statistics, bookmark, and book_read_link creation/verification
@@ -730,7 +690,7 @@ fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
      .unwrap()
      .collect::<Result<Vec<_>, _>>()?;
     
-    let current_time = now_local_micro();
+    let current_time = now_utc_micro();
     for reading_state_id in missing_bookmarks {
         // Create a default bookmark for reading states that don't have one
         tx.execute(

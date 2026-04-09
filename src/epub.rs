@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use crate::models::BookMetadata;
+use crate::utils::get_valid_filename;
 
 /// Maximum cover image size in bytes (200KB)
 const MAX_COVER_SIZE: u64 = 200 * 1024;
@@ -322,7 +323,8 @@ pub fn update_book_files(library_dir: &Path, epub_file: &Path, book_path: &str, 
         return Err(anyhow::anyhow!("Unsupported file extension. File must end in .epub, .kepub, or .kepub.epub"))
     };
 
-    let epub_filename = format!("{} - {}{}", metadata.title, metadata.author, extension);
+    // Matches Calibre-Web: get_valid_filename(title, chars=42) + ' - ' + get_valid_filename(author, chars=42) + ext
+    let epub_filename = format!("{} - {}{}", get_valid_filename(&metadata.title, 42), get_valid_filename(&metadata.author, 42), extension);
     let dest_file = dest_dir.join(epub_filename);
     fs::copy(epub_file, &dest_file)
         .with_context(|| format!("Failed to copy EPUB to {:?}", dest_file))?;

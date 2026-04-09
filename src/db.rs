@@ -83,20 +83,9 @@ fn create_calibre_functions(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// A simplified implementation of Calibre's title sorting logic
-/// Moves common English articles to the end
+/// Implements Calibre's title sorting logic using the same regex as Calibre-Web.
 fn title_sort_logic(title: &str) -> String {
-    let articles = ["the ", "a ", "an ", "le ", "la ", "les ", "el ", "los ", "las "];
-    let lower_title = title.to_lowercase();
-    
-    for article in &articles {
-        if lower_title.starts_with(article) {
-            let len = article.len();
-            return format!("{}, {}", &title[len..], &title[..len - 1]);
-        }
-    }
-    
-    title.to_string()
+    crate::utils::title_sort(title)
 }
 
 #[cfg(test)]
@@ -109,5 +98,8 @@ mod tests {
         assert_eq!(title_sort_logic("A Tale of Two Cities"), "Tale of Two Cities, A");
         assert_eq!(title_sort_logic("An American Tragedy"), "American Tragedy, An");
         assert_eq!(title_sort_logic("Normal Title"), "Normal Title");
+        assert_eq!(title_sort_logic("Der Zauberberg"), "Zauberberg, Der");
+        assert_eq!(title_sort_logic("Les Misérables"), "Misérables, Les");
+        assert_eq!(title_sort_logic("L'Étranger"), "Étranger, L'");
     }
 }

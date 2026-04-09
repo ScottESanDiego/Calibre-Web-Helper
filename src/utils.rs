@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local, TimeZone, Utc};
+use regex::Regex;
 use rusqlite::{params, Transaction, Error as SqliteError, Connection, OptionalExtension};
 use anyhow::{Result, Context};
 use sha1::{Sha1, Digest};
@@ -20,9 +21,148 @@ pub fn now_utc_micro() -> String {
     format_timestamp_micro(&Utc::now())
 }
 
-/// Get current local timestamp formatted for database storage
-pub fn now_local_micro() -> String {
-    format_timestamp_micro(&Local::now())
+/// Matches leading articles in multiple languages, replicating Calibre-Web's
+/// default `config_title_regex` behavior.  The original Python regex uses a
+/// lookbehind `(?<=')` which the Rust regex crate doesn't support, so we
+/// handle the L' case by matching it with an optional trailing apostrophe.
+const TITLE_ARTICLES: &[&str] = &[
+    "A", "The", "An", "Der", "Die", "Das", "Den", "Ein", "Eine",
+    "Einen", "Dem", "Des", "Einem", "Eines", "Le", "La", "Les", "Un", "Une",
+];
+
+/// Sanitize a string for use as a filename, matching Calibre-Web's `get_valid_filename()`.
+///
+/// - Trailing dots become underscores
+/// - Forward slashes and colons become underscores
+/// - Characters `*+:\"/<>?` become underscores
+/// - Pipe `|` becomes comma
+/// - Truncated to `max_chars` bytes (UTF-8 aware)
+/// - Leading/trailing whitespace and zero-width characters stripped
+pub fn get_valid_filename(value: &str, max_chars: usize) -> String {
+    let mut s = value.to_string();
+
+    // Trailing dot -> underscore (matches Python: value[-1:] == '.')
+    if s.ends_with('.') {
+        s.pop();
+        s.push('_');
+    }
+
+    // Replace / and : with _  and strip NUL bytes
+    s = s.replace('/', "_").replace(':', "_").replace('\0', "");
+
+    // Replace *+:\"/<>? with _
+    let bad_chars = Regex::new(r#"[*+:\\"/<>?]+"#).unwrap();
+    s = bad_chars.replace_all(&s, "_").to_string();
+
+    // Replace | with ,
+    let pipe = Regex::new(r"[|]+").unwrap();
+    s = pipe.replace_all(&s, ",").to_string();
+
+    // Truncate to max_chars bytes, respecting UTF-8 boundaries
+    if s.len() > max_chars {
+        let mut end = max_chars;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+
+    strip_whitespaces(&s)
+}
+
+/// Strip leading/trailing whitespace and Unicode zero-width characters,
+/// matching Calibre-Web's `strip_whitespaces()`.
+fn strip_whitespaces(text: &str) -> String {
+    let re = Regex::new(r"(?:^[\s\u{200B}-\u{200D}\u{FEFF}]+)|([\s\u{200B}-\u{200D}\u{FEFF}]+$)").unwrap();
+    re.replace_all(text, "").to_string()
+}
+
+/// Compute title sort using the same logic as Calibre-Web's `title_sort()` from `db.py`.
+///
+/// Matches leading articles and moves them to the end:
+/// "The Great Book" -> "Great Book, The"
+/// "L'Étranger" -> "Étranger, L'"
+pub fn title_sort(title: &str) -> String {
+    // Special-case L' (French elided article) first
+    let lower = title.to_lowercase();
+    if lower.starts_with("l'") {
+        let rest = &title[2..];
+        return strip_whitespaces(&format!("{}, L'", rest));
+    }
+
+    // Check each article followed by whitespace (case-insensitive)
+    for &article in TITLE_ARTICLES {
+        let prefix = format!("{} ", article);
+        if lower.starts_with(&prefix.to_lowercase()) {
+            let actual_article = &title[..article.len()];
+            let rest = &title[article.len()..]; // includes leading space
+            return strip_whitespaces(&format!("{}, {}", rest, actual_article));
+        }
+    }
+
+    strip_whitespaces(title)
+}
+
+/// Compute author sort, matching Calibre-Web's `get_sorted_author()` from `helper.py`.
+///
+/// "John Doe" -> "Doe, John"
+/// "Robert Downey Jr." -> "Downey, Robert Jr."
+/// Already-comma-separated names are returned as-is.
+pub fn get_sorted_author(value: &str) -> String {
+    let value = value.trim();
+    if value.contains(',') {
+        return value.to_string();
+    }
+
+    let suffix_re = Regex::new(r"(?i)^((JR|SR)\.?|I{1,3}\.?|IV\.?)$").unwrap();
+    let parts: Vec<&str> = value.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return value.to_string();
+    }
+
+    if suffix_re.is_match(parts[parts.len() - 1]) {
+        if parts.len() > 1 {
+            let suffix = parts[parts.len() - 1];
+            let last = parts[parts.len() - 2];
+            let first: Vec<&str> = parts[..parts.len() - 2].to_vec();
+            if first.is_empty() {
+                format!("{}, {}", last, suffix)
+            } else {
+                format!("{}, {} {}", last, first.join(" "), suffix)
+            }
+        } else {
+            parts[0].to_string()
+        }
+    } else if parts.len() == 1 {
+        parts[0].to_string()
+    } else {
+        let last = parts[parts.len() - 1];
+        let first: Vec<&str> = parts[..parts.len() - 1].to_vec();
+        format!("{}, {}", last, first.join(" "))
+    }
+}
+
+/// Mark a book as metadata-dirty in the Calibre database.
+/// Calibre-Web writes to `metadata_dirtied` so the Calibre desktop app
+/// knows which OPF files to regenerate.
+pub fn set_metadata_dirty(conn: &Connection, book_id: i64) -> Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM metadata_dirtied WHERE book = ?1",
+            params![book_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .is_some();
+
+    if !exists {
+        conn.execute(
+            "INSERT INTO metadata_dirtied (book) VALUES (?1)",
+            params![book_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Generic find-or-create pattern for database entities
@@ -151,9 +291,10 @@ pub fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: O
     tx.commit()?;
 
     // Fix timestamps in Calibre-Web database if provided
+    // Calibre-Web uses UTC for all its model defaults (datetime.now(timezone.utc))
     if let Some(conn) = appdb_conn {
         let tx = conn.transaction()?;
-        let now_micro = now_local_micro();
+        let now_micro = now_utc_micro();
 
         // Fix shelf timestamps
         let fixed = tx.execute(
@@ -236,7 +377,8 @@ pub fn calculate_file_hash(file_path: &std::path::Path) -> Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     
-    Ok(format!("{:x}", hasher.finalize()))
+    let hash = hasher.finalize();
+    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 /// Validates that an ID is positive and within reasonable bounds
