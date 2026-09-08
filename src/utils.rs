@@ -260,9 +260,12 @@ pub(crate) fn find_or_create_language(
     )
 }
 
-/// Verifies and repairs any NULL timestamp values in both databases.
-/// This is run automatically when opening the databases to prevent NULL value errors.
-pub(crate) fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_conn: Option<&mut Connection>) -> Result<()> {
+/// Verifies and repairs NULL timestamp values in the Calibre database.
+///
+/// Calibre-Web timestamps are intentionally excluded.  They participate in
+/// Kobo sync cursors, so changing unrelated app.db rows as a side effect of an
+/// ordinary command can make an unfixed Calibre-Web server repeat a sync page.
+pub(crate) fn verify_and_repair_timestamps(calibre_conn: &mut Connection) -> Result<()> {
     // Fix timestamps in Calibre database
     let tx = calibre_conn.transaction()?;
     
@@ -295,76 +298,6 @@ pub(crate) fn verify_and_repair_timestamps(calibre_conn: &mut Connection, appdb_
     }
 
     tx.commit()?;
-
-    // Fix timestamps in Calibre-Web database if provided
-    // Calibre-Web uses UTC for all its model defaults (datetime.now(timezone.utc))
-    if let Some(conn) = appdb_conn {
-        let tx = conn.transaction()?;
-        let now_micro = now_utc_micro();
-
-        // Fix shelf timestamps
-        let fixed = tx.execute(
-            "UPDATE shelf SET created = ?1 WHERE created IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} shelves with missing created timestamp", fixed);
-        }
-
-        let fixed = tx.execute(
-            "UPDATE shelf SET last_modified = ?1 WHERE last_modified IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} shelves with missing last_modified timestamp", fixed);
-        }
-
-        // Fix book_shelf_link timestamps
-        let fixed = tx.execute(
-            "UPDATE book_shelf_link SET date_added = ?1 WHERE date_added IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} shelf links with missing date_added", fixed);
-        }
-
-        // Fix archived_book timestamps
-        let fixed = tx.execute(
-            "UPDATE archived_book SET last_modified = ?1 WHERE last_modified IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} archived books with missing last_modified", fixed);
-        }
-
-        // Fix kobo_reading_state timestamps
-        let fixed = tx.execute(
-            "UPDATE kobo_reading_state SET last_modified = ?1 WHERE last_modified IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} Kobo reading states with missing last_modified", fixed);
-        }
-
-        let fixed = tx.execute(
-            "UPDATE kobo_reading_state SET priority_timestamp = ?1 WHERE priority_timestamp IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} Kobo reading states with missing priority_timestamp", fixed);
-        }
-
-        // Fix kobo_bookmark timestamps
-        let fixed = tx.execute(
-            "UPDATE kobo_bookmark SET last_modified = ?1 WHERE last_modified IS NULL",
-            [&now_micro],
-        )?;
-        if fixed > 0 {
-            println!(" -> Fixed {} Kobo bookmarks with missing last_modified", fixed);
-        }
-
-        tx.commit()?;
-    }
 
     Ok(())
 }
@@ -515,4 +448,38 @@ pub(crate) fn validate_foreign_key(
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_repair_updates_only_calibre_books() {
+        let mut calibre_conn = Connection::open_in_memory().unwrap();
+        calibre_conn
+            .execute_batch(
+                "CREATE TABLE books (
+                    id INTEGER PRIMARY KEY,
+                    timestamp TEXT,
+                    pubdate TEXT,
+                    last_modified TEXT
+                 );
+                 INSERT INTO books VALUES (1, NULL, NULL, NULL);",
+            )
+            .unwrap();
+
+        verify_and_repair_timestamps(&mut calibre_conn).unwrap();
+
+        let timestamps: (Option<String>, Option<String>, Option<String>) = calibre_conn
+            .query_row(
+                "SELECT timestamp, pubdate, last_modified FROM books WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(timestamps.0.is_some());
+        assert!(timestamps.1.is_some());
+        assert!(timestamps.2.is_some());
+    }
 }

@@ -49,9 +49,10 @@ fn main() -> Result<()> {
 
     let mut appdb_conn = appdb::open_appdb(cli.appdb_file.as_deref())?;
 
-    // Verify and repair any NULL timestamps in both databases
+    // Repair only Calibre metadata here. Calibre-Web timestamps participate in
+    // Kobo cursors and must never be changed as an ordinary add side effect.
     if let Some(ref mut conn) = calibre_conn {
-        utils::verify_and_repair_timestamps(conn, appdb_conn.as_mut())?;
+        utils::verify_and_repair_timestamps(conn)?;
     }
 
     match cli.command {

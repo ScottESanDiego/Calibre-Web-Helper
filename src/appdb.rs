@@ -1,8 +1,10 @@
+use crate::utils::{format_timestamp_micro, now_utc_micro, validate_id};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use chrono::{Duration, NaiveDateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
-use crate::utils::{now_utc_micro, validate_id};
 
 /// Opens the app.db connection if a path is provided.
 pub(crate) fn open_appdb(path: Option<&Path>) -> Result<Option<Connection>> {
@@ -96,98 +98,43 @@ fn find_or_create_shelf(tx: &rusqlite::Transaction, shelf_name: &str, user_id: i
     }
 }
 
-/// Ensures complete Kobo sync setup for a book: reading state, statistics, bookmark, and book_read_link.
-/// Called by `fix_kobo_sync_issues` to repair incomplete sync records.
-fn ensure_kobo_sync_setup(tx: &Transaction, book_id: i64, user_id: i64, timestamp: &str) -> Result<()> {
-    // Check if reading state already exists
-    let reading_state_id: Option<i64> = tx.query_row(
-        "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-        params![book_id, user_id],
-        |row| row.get(0)
-    ).optional()?;
-    
-    let reading_state_id = if let Some(state_id) = reading_state_id {
-        state_id
-    } else {
-        // Create new reading state
-        tx.execute(
-            "INSERT INTO kobo_reading_state (user_id, book_id, last_modified, priority_timestamp) VALUES (?1, ?2, ?3, ?4)",
-            params![user_id, book_id, timestamp, timestamp],
+/// Returns a timestamp strictly newer than every parseable membership timestamp
+/// for this user. This makes a large directory add safe for Calibre-Web's strict
+/// Kobo cursor even when more than one page is added before the next sync.
+fn next_shelf_link_timestamp(tx: &rusqlite::Transaction, user_id: i64) -> Result<String> {
+    let latest = {
+        let mut stmt = tx.prepare(
+            "SELECT bsl.date_added
+             FROM book_shelf_link bsl
+             JOIN shelf s ON s.id = bsl.shelf
+             WHERE s.user_id = ?1 AND typeof(bsl.date_added) = 'text'",
         )?;
-        
-        // Get the ID of the newly created reading state
-        tx.query_row(
-            "SELECT id FROM kobo_reading_state WHERE book_id = ?1 AND user_id = ?2",
-            params![book_id, user_id],
-            |row| row.get(0)
-        )?
+        let timestamps = stmt.query_map([user_id], |row| row.get::<_, String>(0))?;
+        let mut latest: Option<chrono::DateTime<Utc>> = None;
+        for timestamp in timestamps {
+            let timestamp = timestamp?;
+            if let Ok(parsed) =
+                NaiveDateTime::parse_from_str(&timestamp, "%Y-%m-%d %H:%M:%S%.f")
+            {
+                let parsed = parsed.and_utc();
+                latest = Some(latest.map_or(parsed, |current| current.max(parsed)));
+            }
+        }
+        latest
     };
-    
-    // Ensure kobo_statistics entry exists
-    let has_statistics: bool = tx.query_row(
-        "SELECT 1 FROM kobo_statistics WHERE kobo_reading_state_id = ?1",
-        params![reading_state_id],
-        |_| Ok(true)
-    ).optional()?.is_some();
-    
-    if !has_statistics {
-        tx.execute(
-            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) VALUES (?1, ?2, NULL, NULL)",
-            params![reading_state_id, timestamp],
-        )?;
-    }
-    
-    // Ensure kobo_bookmark exists and is linked as current bookmark
-    let has_bookmark: bool = tx.query_row(
-        "SELECT 1 FROM kobo_bookmark WHERE kobo_reading_state_id = ?1",
-        params![reading_state_id],
-        |_| Ok(true)
-    ).optional()?.is_some();
-    
-    if !has_bookmark {
-        tx.execute(
-            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
-             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
-            params![reading_state_id, timestamp],
-        )?;
-        
-        let bookmark_id = tx.last_insert_rowid();
-        
-        // Set this as the current bookmark for the reading state
-        tx.execute(
-            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
-            params![bookmark_id, reading_state_id],
-        )?;
-    }
-    
-    // Ensure book_read_link exists for Kobo sync compatibility
-    let has_book_read_link: bool = tx.query_row(
-        "SELECT 1 FROM book_read_link WHERE book_id = ?1 AND user_id = ?2",
-        params![book_id, user_id],
-        |_| Ok(true)
-    ).optional()?.is_some();
 
-    if !has_book_read_link {
-        tx.execute(
-            "INSERT INTO book_read_link (book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading) VALUES (?1, ?2, 0, ?3, NULL, 0)",
-            params![book_id, user_id, timestamp],
-        )?;
-    }
-    
-    Ok(())
-}
-
-/// Synchronizes timestamps for all books on Kobo shelves to ensure consistent sync behavior.
-/// This function updates all books on Kobo shelves to have the same recent timestamp.
-fn sync_kobo_shelf_timestamps(tx: &Transaction, timestamp: &str) -> Result<usize> {
-    let updated_books = tx.execute(
-        "UPDATE book_shelf_link 
-         SET date_added = ?1 
-         WHERE shelf IN (SELECT id FROM shelf WHERE kobo_sync = 1)",
-        [timestamp],
-    )?;
-    
-    Ok(updated_books)
+    // Compare at the same precision that is stored. Otherwise two nanosecond-
+    // distinct values can truncate to the same microsecond string.
+    let now = NaiveDateTime::parse_from_str(
+        &format_timestamp_micro(&Utc::now()),
+        "%Y-%m-%d %H:%M:%S%.f",
+    )?
+    .and_utc();
+    let timestamp = match latest {
+        Some(latest) if latest >= now => latest + Duration::microseconds(1),
+        _ => now,
+    };
+    Ok(format_timestamp_micro(&timestamp))
 }
 
 /// Core function to add a book to a shelf with duplicate handling control.
@@ -239,7 +186,7 @@ fn add_book_to_shelf_core(conn: &mut Connection, book_id: i64, shelf_name: &str,
     )?;
 
     // Insert the book-shelf link with UTC timestamp (matches Calibre-Web's datetime.now(timezone.utc))
-    let now_micro = now_utc_micro();
+    let now_micro = next_shelf_link_timestamp(&tx, user_id)?;
     
     tx.execute(
         "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added) VALUES (?1, ?2, ?3, ?4)",
@@ -501,257 +448,343 @@ pub(crate) fn clean_empty_shelves(appdb_conn: &mut Connection, calibre_conn: &Co
     Ok(())
 }
 
-/// Diagnoses and fixes Kobo sync issues for existing shelf links
+#[derive(Debug)]
+struct ReadingStateRepair {
+    id: i64,
+    user_id: Option<i64>,
+    book_id: Option<i64>,
+    last_modified_is_null: bool,
+    priority_timestamp_is_null: bool,
+    statistics_count: i64,
+    null_statistics_timestamps: i64,
+    preferred_bookmark_id: Option<i64>,
+    bookmark_count: i64,
+    null_bookmark_timestamps: i64,
+    current_bookmark_is_valid: bool,
+    has_book_read_link: bool,
+}
+
+impl ReadingStateRepair {
+    fn needs_repair(&self) -> bool {
+        self.last_modified_is_null
+            || self.priority_timestamp_is_null
+            || self.statistics_count == 0
+            || self.null_statistics_timestamps > 0
+            || self.bookmark_count == 0
+            || self.null_bookmark_timestamps > 0
+            || !self.current_bookmark_is_valid
+            || !self.has_book_read_link
+    }
+}
+
+/// Repairs incomplete graphs rooted at existing Kobo reading states.
+///
+/// Shelf membership timestamps are Kobo pagination cursors, so this repair must
+/// never rewrite them or create reading states for shelf members.
 pub(crate) fn fix_kobo_sync_issues(appdb_conn: &mut Connection) -> Result<()> {
-    println!("🔧 Diagnosing and fixing Kobo sync issues...");
-    
-    // Create backup before making changes
-    // Note: We can't directly get the path from Connection, so we'll document this requirement
-    
-    let tx = appdb_conn.transaction()
-        .context("Failed to start Kobo sync fix transaction")?;
-    
-    // Find all books on Kobo sync shelves that aren't properly set up for sync
-    let mut stmt = tx.prepare(
-        "SELECT DISTINCT bsl.book_id, s.id as shelf_id, s.user_id, u.name as username
-         FROM book_shelf_link bsl
-         JOIN shelf s ON bsl.shelf = s.id
-         LEFT JOIN user u ON s.user_id = u.id
-         WHERE s.kobo_sync = 1"
-    )?;
-    
-    let books_on_kobo_shelves = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>("book_id")?,
-            row.get::<_, i64>("shelf_id")?,
-            row.get::<_, i64>("user_id")?,
-            row.get::<_, Option<String>>("username")?,
-        ))
-    })?;
-    
-    // Collect results before dropping the statement
-    let books_to_process: Vec<_> = books_on_kobo_shelves.collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-    
-    let book_count = books_to_process.len();
-    
-    for (book_id, shelf_id, user_id, username) in books_to_process {
-        let username = username.unwrap_or_else(|| "unknown".to_string());
-        let now_micro = now_utc_micro();
-        
-        // Use the shared function to ensure complete Kobo sync setup
-        // This handles reading state, statistics, bookmark, and book_read_link creation/verification
-        ensure_kobo_sync_setup(&tx, book_id, user_id, &now_micro)?;
-        println!(" -> Ensured complete Kobo sync setup for book {} (user {})", book_id, username);
-        
-        // Update the shelf's last_modified timestamp to trigger sync detection
-        tx.execute(
-            "UPDATE shelf SET last_modified = ?1 WHERE id = ?2",
-            params![now_micro, shelf_id],
-        )?;
-    }
-    
-    // Also check and fix any kobo_reading_state entries that have inconsistent timestamps
-    let orphaned_states = tx.execute(
-        "UPDATE kobo_reading_state 
-         SET last_modified = priority_timestamp 
-         WHERE last_modified IS NULL AND priority_timestamp IS NOT NULL",
-        [],
-    )?;
-    
-    if orphaned_states > 0 {
-        println!(" -> Fixed {} reading states with NULL last_modified", orphaned_states);
-    }
-    
-    let orphaned_priorities = tx.execute(
-        "UPDATE kobo_reading_state 
-         SET priority_timestamp = last_modified 
-         WHERE priority_timestamp IS NULL AND last_modified IS NOT NULL",
-        [],
-    )?;
-    
-    if orphaned_priorities > 0 {
-        println!(" -> Fixed {} reading states with NULL priority_timestamp", orphaned_priorities);
+    println!("🔧 Repairing existing Kobo reading-state data...");
+
+    ensure_current_bookmark_column(appdb_conn)?;
+    appdb_conn
+        .pragma_update(None, "foreign_keys", "ON")
+        .context("Failed to enable foreign key enforcement before Kobo repair")?;
+
+    let repair_result = repair_existing_kobo_state_graphs(appdb_conn);
+
+    // A failed transaction is rolled back when it is dropped. Explicitly restore
+    // and verify the connection setting before returning either result.
+    appdb_conn
+        .pragma_update(None, "foreign_keys", "ON")
+        .context("Failed to leave foreign key enforcement enabled after Kobo repair")?;
+    let foreign_keys_enabled: i64 = appdb_conn
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .context("Failed to verify foreign key enforcement after Kobo repair")?;
+    if foreign_keys_enabled != 1 {
+        anyhow::bail!("Foreign key enforcement is disabled after Kobo repair");
     }
 
-    if book_count > 0 || orphaned_states > 0 || orphaned_priorities > 0 {
-        println!("✅ Processed {} books and fixed {} orphaned timestamps.", book_count, orphaned_states + orphaned_priorities);
-        println!("🔄 Books are now ready for proper Calibre-Web sync.");
+    let (removed_duplicates, repaired_states) = repair_result?;
+    if removed_duplicates == 0 && repaired_states == 0 {
+        println!("✅ No Kobo reading-state repairs were needed.");
     } else {
-        println!("✅ No cleanup needed.");
+        println!(
+            "✅ Kobo repair complete: removed {} duplicate states and repaired {} existing states.",
+            removed_duplicates, repaired_states
+        );
     }
-    
-    // Step 3: Repair missing kobo_statistics entries
-    println!("\n📊 Repairing missing kobo_statistics entries...");
-    let mut repaired_statistics = 0;
-    
-    // Collect missing statistics in a block to release the prepared statement
-    let missing_stats = {
-        let mut stats_stmt = tx.prepare(
-            "SELECT krs.id, krs.book_id, krs.last_modified 
-             FROM kobo_reading_state krs 
-             LEFT JOIN kobo_statistics ks ON krs.id = ks.kobo_reading_state_id 
-             WHERE ks.id IS NULL"
-        )?;
-        
-        stats_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>("id")?,
-                row.get::<_, i64>("book_id")?,
-                row.get::<_, String>("last_modified")?,
-            ))
-        })?.collect::<Result<Vec<_>, _>>()?
-    };
-    
-    for (reading_state_id, book_id, timestamp) in missing_stats {
-        tx.execute(
-            "INSERT INTO kobo_statistics (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes) 
-             VALUES (?1, ?2, NULL, NULL)",
-            params![reading_state_id, timestamp],
-        )?;
-        
-        println!(" -> Created kobo_statistics entry for book {} (reading_state_id: {})", book_id, reading_state_id);
-        repaired_statistics += 1;
-    }
-    
-    // Step 4: Reset timestamps for books on Kobo shelves to ensure they sync
-    println!("\n⏰ Resetting sync timestamps to force inclusion in next sync...");
-    
-    // Get all books on Kobo shelves and reset their timestamps to current time
-    let current_time = now_utc_micro();
-    let updated_books = sync_kobo_shelf_timestamps(&tx, &current_time)?;
-    
-    if updated_books > 0 {
-        println!(" -> Reset timestamps for {} books on Kobo shelves to {}", updated_books, current_time);
-    }
-    
-    // Final summary
-    if repaired_statistics > 0 || updated_books > 0 {
-        println!("\n✅ Additional fixes applied:");
-        if repaired_statistics > 0 {
-            println!("   - Repaired {} missing statistics entries", repaired_statistics);
-        }
-        if updated_books > 0 {
-            println!("   - Reset timestamps for {} books to force sync", updated_books);
-        }
-    }
-    
-    // Commit all changes
-    tx.commit()?;
-    
-    println!("\n� Checking and fixing Kobo reading state schema...");
-    fix_kobo_reading_state_schema(appdb_conn)?;
+    println!(" -> Shelf membership timestamps were left unchanged.");
 
-    println!("\n�🔄 All books on Kobo shelves are now ready for proper Calibre-Web sync!");
-    
     Ok(())
 }
 
-/// Fixes schema issues and data problems in kobo_reading_state and kobo_bookmark tables
-fn fix_kobo_reading_state_schema(conn: &mut Connection) -> Result<()> {
-    // Check if current_bookmark column exists
-    let has_current_bookmark: bool = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kobo_reading_state'")?
-        .query_row([], |row| {
-            let sql: String = row.get(0)?;
-            Ok(sql.contains("current_bookmark"))
-        })
-        .unwrap_or(false);
-    
+fn ensure_current_bookmark_column(conn: &Connection) -> Result<()> {
+    let has_current_bookmark = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(kobo_reading_state)")
+            .context("Failed to inspect kobo_reading_state schema")?;
+        let column_names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        column_names.iter().any(|name| name == "current_bookmark")
+    };
+
     if !has_current_bookmark {
-        println!(" -> Adding missing current_bookmark column to kobo_reading_state table");
-        // First disable foreign keys, add column, then re-enable
-        conn.execute("PRAGMA foreign_keys = OFF", [])?;
+        println!(" -> Adding nullable current_bookmark column");
         conn.execute(
             "ALTER TABLE kobo_reading_state ADD COLUMN current_bookmark INTEGER",
             [],
-        )?;
-        conn.execute("PRAGMA foreign_keys = ON", [])?;
-    } else {
-        println!(" -> current_bookmark column already exists");
+        )
+        .context("Failed to add current_bookmark column")?;
     }
-    
-    // Now handle data fixes in a transaction with foreign keys disabled temporarily
-    conn.execute("PRAGMA foreign_keys = OFF", [])?;
-    let tx = conn.transaction()?;
-    
-    // Remove duplicate reading states (keep the most recent one for each book/user combination)
-    // But first, handle any bookmarks that might be orphaned
-    let duplicate_states: Vec<i64> = tx.prepare(
-        "SELECT krs.id FROM kobo_reading_state krs 
-         WHERE krs.id NOT IN (
-             SELECT MAX(id) FROM kobo_reading_state GROUP BY user_id, book_id
-         )"
-    )?.query_map([], |row| row.get::<_, i64>(0))?
-     .collect::<Result<Vec<_>, _>>()?;
-    
-    // Delete any bookmarks associated with duplicate reading states first
-    for state_id in &duplicate_states {
+
+    Ok(())
+}
+
+fn repair_existing_kobo_state_graphs(conn: &mut Connection) -> Result<(usize, usize)> {
+    let tx = conn
+        .transaction()
+        .context("Failed to start Kobo data repair transaction")?;
+
+    let ranked_states = {
+        let mut stmt = tx.prepare(
+            "SELECT krs.id, krs.user_id, krs.book_id
+             FROM kobo_reading_state krs
+             ORDER BY
+                 krs.user_id,
+                 krs.book_id,
+                 EXISTS(
+                     SELECT 1 FROM kobo_bookmark kb
+                     WHERE kb.id = krs.current_bookmark
+                       AND kb.kobo_reading_state_id = krs.id
+                 ) DESC,
+                 EXISTS(
+                     SELECT 1 FROM kobo_bookmark kb
+                     WHERE kb.kobo_reading_state_id = krs.id
+                 ) DESC,
+                 (SELECT MAX(kb.last_modified) FROM kobo_bookmark kb
+                  WHERE kb.kobo_reading_state_id = krs.id) DESC,
+                 krs.last_modified DESC,
+                 krs.id DESC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut canonical_by_key = HashMap::new();
+    let mut duplicate_states = Vec::new();
+    for (state_id, user_id, book_id) in ranked_states {
+        let key = (user_id, book_id);
+        if let Some(canonical_state_id) = canonical_by_key.get(&key) {
+            duplicate_states.push((state_id, *canonical_state_id));
+        } else {
+            canonical_by_key.insert(key, state_id);
+        }
+    }
+
+    let mut merged_state_ids = HashSet::new();
+    for (state_id, canonical_state_id) in &duplicate_states {
+        let canonical_current_is_valid: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM kobo_bookmark kb
+                 JOIN kobo_reading_state krs ON krs.id = ?1
+                 WHERE kb.id = krs.current_bookmark
+                   AND kb.kobo_reading_state_id = krs.id
+             )",
+            params![canonical_state_id],
+            |row| row.get(0),
+        )?;
+        if !canonical_current_is_valid {
+            tx.execute(
+                "UPDATE kobo_reading_state SET current_bookmark = NULL WHERE id = ?1",
+                params![canonical_state_id],
+            )?;
+        }
+
+        let latest_priority: Option<String> = tx.query_row(
+            "SELECT MAX(priority_timestamp) FROM kobo_reading_state
+             WHERE id IN (?1, ?2) AND priority_timestamp IS NOT NULL",
+            params![canonical_state_id, state_id],
+            |row| row.get(0),
+        )?;
+        if let Some(priority_timestamp) = latest_priority {
+            tx.execute(
+                "UPDATE kobo_reading_state SET priority_timestamp = ?1 WHERE id = ?2",
+                params![priority_timestamp, canonical_state_id],
+            )?;
+        }
+
+        let retained_statistics_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM kobo_statistics
+                 WHERE kobo_reading_state_id IN (?1, ?2)
+                 ORDER BY last_modified DESC, id DESC
+                 LIMIT 1",
+                params![canonical_state_id, state_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(statistics_id) = retained_statistics_id {
+            tx.execute(
+                "DELETE FROM kobo_statistics
+                 WHERE kobo_reading_state_id IN (?1, ?2) AND id != ?3",
+                params![canonical_state_id, state_id, statistics_id],
+            )?;
+            tx.execute(
+                "UPDATE kobo_statistics SET kobo_reading_state_id = ?1 WHERE id = ?2",
+                params![canonical_state_id, statistics_id],
+            )?;
+        }
+
         tx.execute(
-            "DELETE FROM kobo_bookmark WHERE kobo_reading_state_id = ?1",
+            "UPDATE kobo_bookmark SET kobo_reading_state_id = ?1
+             WHERE kobo_reading_state_id = ?2",
+            params![canonical_state_id, state_id],
+        )?;
+        tx.execute(
+            "DELETE FROM kobo_reading_state WHERE id = ?1",
             params![state_id],
         )?;
+        merged_state_ids.insert(*canonical_state_id);
     }
-    
-    // Now safely delete the duplicate reading states
-    let removed_duplicates = tx.execute(
-        "DELETE FROM kobo_reading_state WHERE id NOT IN (
-            SELECT MAX(id) FROM kobo_reading_state GROUP BY user_id, book_id
-        )",
-        [],
-    )?;
-    
-    if removed_duplicates > 0 {
-        println!(" -> Removed {} duplicate reading states", removed_duplicates);
-    }
-    
-    // Ensure all reading states have bookmarks
-    let missing_bookmarks: Vec<i64> = tx.prepare(
-        "SELECT krs.id FROM kobo_reading_state krs 
-         LEFT JOIN kobo_bookmark kb ON krs.id = kb.kobo_reading_state_id 
-         WHERE kb.id IS NULL"
-    )?.query_map([], |row| row.get::<_, i64>(0))?
-     .collect::<Result<Vec<_>, _>>()?;
-    
-    let current_time = now_utc_micro();
-    for reading_state_id in missing_bookmarks {
-        // Create a default bookmark for reading states that don't have one
-        tx.execute(
-            "INSERT INTO kobo_bookmark (kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent) 
-             VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
-            params![reading_state_id, current_time],
+
+    let states = {
+        let mut stmt = tx.prepare(
+            "SELECT
+                krs.id,
+                krs.user_id,
+                krs.book_id,
+                krs.last_modified IS NULL,
+                krs.priority_timestamp IS NULL,
+                (SELECT COUNT(*) FROM kobo_statistics ks
+                 WHERE ks.kobo_reading_state_id = krs.id),
+                (SELECT COUNT(*) FROM kobo_statistics ks
+                 WHERE ks.kobo_reading_state_id = krs.id AND ks.last_modified IS NULL),
+                (SELECT kb.id FROM kobo_bookmark kb
+                 WHERE kb.kobo_reading_state_id = krs.id
+                 ORDER BY kb.last_modified DESC, kb.id DESC LIMIT 1),
+                (SELECT COUNT(*) FROM kobo_bookmark kb
+                 WHERE kb.kobo_reading_state_id = krs.id),
+                (SELECT COUNT(*) FROM kobo_bookmark kb
+                 WHERE kb.kobo_reading_state_id = krs.id AND kb.last_modified IS NULL),
+                EXISTS(
+                    SELECT 1 FROM kobo_bookmark kb
+                    WHERE kb.id = krs.current_bookmark
+                      AND kb.kobo_reading_state_id = krs.id
+                ),
+                CASE
+                    WHEN krs.user_id IS NULL OR krs.book_id IS NULL THEN 1
+                    ELSE EXISTS(
+                        SELECT 1 FROM book_read_link brl
+                        WHERE brl.user_id = krs.user_id AND brl.book_id = krs.book_id
+                    )
+                END
+             FROM kobo_reading_state krs
+             ORDER BY krs.id",
         )?;
-        
-        let bookmark_id = tx.last_insert_rowid();
-        
-        // Set this as the current bookmark for the reading state
+        stmt.query_map([], |row| {
+            Ok(ReadingStateRepair {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                book_id: row.get(2)?,
+                last_modified_is_null: row.get(3)?,
+                priority_timestamp_is_null: row.get(4)?,
+                statistics_count: row.get(5)?,
+                null_statistics_timestamps: row.get(6)?,
+                preferred_bookmark_id: row.get(7)?,
+                bookmark_count: row.get(8)?,
+                null_bookmark_timestamps: row.get(9)?,
+                current_bookmark_is_valid: row.get(10)?,
+                has_book_read_link: row.get(11)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let states_to_repair: Vec<_> = states
+        .into_iter()
+        .filter(|state| state.needs_repair() || merged_state_ids.contains(&state.id))
+        .collect();
+    let repair_started_at = Utc::now();
+
+    for (sequence, state) in states_to_repair.iter().enumerate() {
+        let repair_timestamp = crate::utils::format_timestamp_micro(
+            &(repair_started_at + Duration::microseconds(sequence as i64)),
+        );
+
+        if state.statistics_count == 0 {
+            tx.execute(
+                "INSERT INTO kobo_statistics
+                    (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes)
+                 VALUES (?1, ?2, NULL, NULL)",
+                params![state.id, &repair_timestamp],
+            )?;
+        } else if state.null_statistics_timestamps > 0 {
+            tx.execute(
+                "UPDATE kobo_statistics SET last_modified = ?1
+                 WHERE kobo_reading_state_id = ?2 AND last_modified IS NULL",
+                params![&repair_timestamp, state.id],
+            )?;
+        }
+
+        let preferred_bookmark_id = if state.bookmark_count == 0 {
+            tx.execute(
+                "INSERT INTO kobo_bookmark
+                    (kobo_reading_state_id, last_modified, location_source, location_type,
+                     location_value, progress_percent, content_source_progress_percent)
+                 VALUES (?1, ?2, 'Unknown', 'Unknown', '', 0.0, 0.0)",
+                params![state.id, &repair_timestamp],
+            )?;
+            tx.last_insert_rowid()
+        } else {
+            if state.null_bookmark_timestamps > 0 {
+                tx.execute(
+                    "UPDATE kobo_bookmark SET last_modified = ?1
+                     WHERE kobo_reading_state_id = ?2 AND last_modified IS NULL",
+                    params![&repair_timestamp, state.id],
+                )?;
+            }
+            state
+                .preferred_bookmark_id
+                .context("Existing bookmark could not be selected")?
+        };
+
+        if !state.current_bookmark_is_valid {
+            tx.execute(
+                "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
+                params![preferred_bookmark_id, state.id],
+            )?;
+        }
+
+        if !state.has_book_read_link
+            && let (Some(user_id), Some(book_id)) = (state.user_id, state.book_id)
+        {
+            tx.execute(
+                "INSERT INTO book_read_link
+                    (book_id, user_id, read_status, last_modified,
+                     last_time_started_reading, times_started_reading)
+                 VALUES (?1, ?2, 0, ?3, NULL, 0)",
+                params![book_id, user_id, &repair_timestamp],
+            )?;
+        }
+
         tx.execute(
-            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = ?2",
-            params![bookmark_id, reading_state_id],
+            "UPDATE kobo_reading_state
+             SET last_modified = ?1,
+                 priority_timestamp = COALESCE(priority_timestamp, ?1)
+             WHERE id = ?2",
+            params![&repair_timestamp, state.id],
         )?;
-        
-        println!(" -> Created missing bookmark for reading state {}", reading_state_id);
     }
-    
-    // Update current_bookmark references for existing reading states that have bookmarks but no current_bookmark set
-    let updated_refs = tx.execute(
-        "UPDATE kobo_reading_state SET current_bookmark = (
-            SELECT kb.id FROM kobo_bookmark kb WHERE kb.kobo_reading_state_id = kobo_reading_state.id LIMIT 1
-         ) WHERE current_bookmark IS NULL AND EXISTS (
-            SELECT 1 FROM kobo_bookmark kb WHERE kb.kobo_reading_state_id = kobo_reading_state.id
-         )",
-        [],
-    )?;
-    
-    if updated_refs > 0 {
-        println!(" -> Updated current_bookmark references for {} reading states", updated_refs);
-    }
-    
-    tx.commit()?;
-    
-    // Re-enable foreign keys
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
-    
-    Ok(())
+
+    tx.commit()
+        .context("Failed to commit Kobo data repair transaction")?;
+
+    Ok((duplicate_states.len(), states_to_repair.len()))
 }
 
 /// Provides detailed diagnostics for Kobo sync setup
@@ -889,4 +922,588 @@ pub(crate) fn add_existing_book_to_shelf(conn: &mut Connection, book_id: i64, sh
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::types::Value;
+    use std::collections::HashSet;
 
+    fn appdb_fixture(with_current_bookmark: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let current_bookmark_column = if with_current_bookmark {
+            ", current_bookmark INTEGER"
+        } else {
+            ""
+        };
+        conn.execute_batch(&format!(
+            "CREATE TABLE user (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+             );
+             CREATE TABLE shelf (
+                id INTEGER PRIMARY KEY,
+                uuid TEXT,
+                name TEXT NOT NULL,
+                is_public INTEGER NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES user(id),
+                kobo_sync INTEGER NOT NULL,
+                created TEXT,
+                last_modified TEXT
+             );
+             CREATE TABLE book_shelf_link (
+                id INTEGER PRIMARY KEY,
+                book_id INTEGER NOT NULL,
+                shelf INTEGER NOT NULL REFERENCES shelf(id),
+                \"order\" INTEGER NOT NULL,
+                date_added
+             );
+             CREATE TABLE kobo_reading_state (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                book_id INTEGER,
+                last_modified TEXT,
+                priority_timestamp TEXT
+                {current_bookmark_column}
+             );
+             CREATE TABLE kobo_statistics (
+                id INTEGER PRIMARY KEY,
+                kobo_reading_state_id INTEGER NOT NULL REFERENCES kobo_reading_state(id),
+                last_modified TEXT,
+                remaining_time_minutes INTEGER,
+                spent_reading_minutes INTEGER
+             );
+             CREATE TABLE kobo_bookmark (
+                id INTEGER PRIMARY KEY,
+                kobo_reading_state_id INTEGER NOT NULL REFERENCES kobo_reading_state(id),
+                last_modified TEXT,
+                location_source TEXT,
+                location_type TEXT,
+                location_value TEXT,
+                progress_percent REAL,
+                content_source_progress_percent REAL
+             );
+             CREATE TABLE book_read_link (
+                id INTEGER PRIMARY KEY,
+                book_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES user(id),
+                read_status INTEGER NOT NULL,
+                last_modified TEXT,
+                last_time_started_reading TEXT,
+                times_started_reading INTEGER NOT NULL,
+                UNIQUE(book_id, user_id)
+             );"
+        ))
+        .unwrap();
+        conn.execute("INSERT INTO user (id, name) VALUES (1, 'reader')", [])
+            .unwrap();
+        conn
+    }
+
+    fn insert_state(conn: &Connection, id: i64, book_id: i64) {
+        conn.execute(
+            "INSERT INTO kobo_reading_state
+                (id, user_id, book_id, last_modified, priority_timestamp, current_bookmark)
+             VALUES (?1, 1, ?2, '2020-01-01 00:00:00.000000', ?3, NULL)",
+            params![id, book_id, format!("priority-{id:04}")],
+        )
+        .unwrap();
+    }
+
+    fn insert_bookmark(conn: &Connection, state_id: i64, progress: f64) -> i64 {
+        conn.execute(
+            "INSERT INTO kobo_bookmark
+                (kobo_reading_state_id, last_modified, location_source, location_type,
+                 location_value, progress_percent, content_source_progress_percent)
+             VALUES (?1, '2020-01-01 00:00:00.000000', 'Kobo', 'EPUB', 'location', ?2, ?2)",
+            params![state_id, progress],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_statistics(conn: &Connection, state_id: i64) {
+        conn.execute(
+            "INSERT INTO kobo_statistics
+                (kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes)
+             VALUES (?1, '2020-01-01 00:00:00.000000', 12, 34)",
+            params![state_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_read_link(conn: &Connection, book_id: i64) {
+        conn.execute(
+            "INSERT INTO book_read_link
+                (book_id, user_id, read_status, last_modified,
+                 last_time_started_reading, times_started_reading)
+             VALUES (?1, 1, 0, '2020-01-01 00:00:00.000000', NULL, 0)",
+            params![book_id],
+        )
+        .unwrap();
+    }
+
+    fn data_snapshot(conn: &Connection) -> String {
+        let queries = [
+            "SELECT id, user_id, book_id, last_modified, priority_timestamp, current_bookmark FROM kobo_reading_state ORDER BY id",
+            "SELECT id, kobo_reading_state_id, last_modified, remaining_time_minutes, spent_reading_minutes FROM kobo_statistics ORDER BY id",
+            "SELECT id, kobo_reading_state_id, last_modified, location_source, location_type, location_value, progress_percent, content_source_progress_percent FROM kobo_bookmark ORDER BY id",
+            "SELECT id, book_id, user_id, read_status, last_modified, last_time_started_reading, times_started_reading FROM book_read_link ORDER BY id",
+        ];
+        let mut snapshot = String::new();
+        for query in queries {
+            let mut stmt = conn.prepare(query).unwrap();
+            let column_count = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..column_count)
+                        .map(|column| row.get::<_, Value>(column))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            snapshot.push_str(&format!("{rows:?}\n"));
+        }
+        snapshot
+    }
+
+    #[test]
+    fn large_kobo_shelf_keeps_timestamps_and_does_not_create_states() {
+        let mut conn = appdb_fixture(true);
+        conn.execute(
+            "INSERT INTO shelf
+                (id, uuid, name, is_public, user_id, kobo_sync, created, last_modified)
+             VALUES (1, 'shelf', 'Kobo', 0, 1, 1, 'created', 'shelf-modified')",
+            [],
+        )
+        .unwrap();
+        for book_id in 1..=224 {
+            let timestamp = if book_id % 2 == 0 {
+                Value::Text(format!("added-{book_id:03}"))
+            } else {
+                Value::Blob(format!("raw-{book_id:03}").into_bytes())
+            };
+            conn.execute(
+                "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added)
+                 VALUES (?1, 1, ?1, ?2)",
+                params![book_id, timestamp],
+            )
+            .unwrap();
+        }
+
+        let before_links: Vec<(i64, Value)> = conn
+            .prepare("SELECT book_id, date_added FROM book_shelf_link ORDER BY book_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let before_shelf: Value = conn
+            .query_row("SELECT last_modified FROM shelf WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        fix_kobo_sync_issues(&mut conn).unwrap();
+
+        let after_links: Vec<(i64, Value)> = conn
+            .prepare("SELECT book_id, date_added FROM book_shelf_link ORDER BY book_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let after_shelf: Value = conn
+            .query_row("SELECT last_modified FROM shelf WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kobo_reading_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(before_links, after_links);
+        assert_eq!(before_shelf, after_shelf);
+        assert_eq!(state_count, 0);
+    }
+
+    #[test]
+    fn repaired_states_page_once_with_strict_cursor_and_preserve_progress() {
+        let mut conn = appdb_fixture(true);
+        for state_id in 1..=125 {
+            insert_state(&conn, state_id, state_id);
+        }
+        conn.execute(
+            "UPDATE kobo_reading_state SET last_modified = NULL WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kobo_reading_state SET priority_timestamp = NULL WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        let bookmark_id = insert_bookmark(&conn, 1, 42.5);
+        conn.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = 1",
+            params![bookmark_id],
+        )
+        .unwrap();
+
+        fix_kobo_sync_issues(&mut conn).unwrap();
+
+        let timestamps: Vec<String> = conn
+            .prepare("SELECT last_modified FROM kobo_reading_state ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(timestamps.len(), 125);
+        assert!(timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(timestamps.iter().collect::<HashSet<_>>().len(), 125);
+        let repaired_priority: String = conn
+            .query_row(
+                "SELECT priority_timestamp FROM kobo_reading_state WHERE id = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired_priority, timestamps[2]);
+
+        let priority: String = conn
+            .query_row(
+                "SELECT priority_timestamp FROM kobo_reading_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let progress: f64 = conn
+            .query_row(
+                "SELECT progress_percent FROM kobo_bookmark WHERE id = ?1",
+                params![bookmark_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(priority, "priority-0001");
+        assert_eq!(progress, 42.5);
+
+        for table in ["kobo_statistics", "kobo_bookmark", "book_read_link"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 125, "unexpected count for {table}");
+        }
+
+        let mut cursor = "0001-01-01 00:00:00.000000".to_string();
+        let mut seen = Vec::new();
+        loop {
+            let page: Vec<(i64, String)> = conn
+                .prepare(
+                    "SELECT id, last_modified FROM kobo_reading_state
+                     WHERE last_modified > ?1 ORDER BY last_modified, id LIMIT 100",
+                )
+                .unwrap()
+                .query_map(params![&cursor], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().unwrap().1.clone();
+            seen.extend(page.into_iter().map(|(id, _)| id));
+            assert!(seen.len() <= 125, "strict cursor repeated a repaired state");
+        }
+        assert_eq!(seen, (1..=125).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn second_repair_is_a_data_noop_and_duplicates_are_cleaned() {
+        let mut conn = appdb_fixture(true);
+        insert_state(&conn, 1, 7);
+        conn.execute(
+            "UPDATE kobo_reading_state SET priority_timestamp = NULL WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        insert_statistics(&conn, 1);
+        let retained_bookmark_id = insert_bookmark(&conn, 1, 75.0);
+        conn.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = 1",
+            params![retained_bookmark_id],
+        )
+        .unwrap();
+        insert_state(&conn, 2, 7);
+        insert_statistics(&conn, 2);
+        conn.execute(
+            "UPDATE kobo_statistics
+             SET last_modified = '2025-01-01 00:00:00.000000',
+                 remaining_time_minutes = 99,
+                 spent_reading_minutes = 88
+             WHERE kobo_reading_state_id = 2",
+            [],
+        )
+        .unwrap();
+        let merged_bookmark_id = insert_bookmark(&conn, 2, 25.0);
+        conn.execute(
+            "UPDATE kobo_bookmark
+             SET last_modified = '2024-01-01 00:00:00.000000'
+             WHERE id = ?1",
+            params![merged_bookmark_id],
+        )
+        .unwrap();
+
+        fix_kobo_sync_issues(&mut conn).unwrap();
+        let after_first = data_snapshot(&conn);
+        fix_kobo_sync_issues(&mut conn).unwrap();
+        let after_second = data_snapshot(&conn);
+
+        assert_eq!(after_first, after_second);
+        let state_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM kobo_reading_state ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(state_ids, vec![1]);
+        let retained_priority: String = conn
+            .query_row(
+                "SELECT priority_timestamp FROM kobo_reading_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_priority, "priority-0002");
+        let bookmarks: Vec<(i64, i64, f64)> = conn
+            .prepare(
+                "SELECT id, kobo_reading_state_id, progress_percent
+                 FROM kobo_bookmark ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            bookmarks,
+            vec![
+                (retained_bookmark_id, 1, 75.0),
+                (merged_bookmark_id, 1, 25.0)
+            ]
+        );
+        let statistics: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), kobo_reading_state_id,
+                        remaining_time_minutes, spent_reading_minutes
+                 FROM kobo_statistics",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(statistics, (1, 1, 99, 88));
+        let discarded_children: i64 = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM kobo_statistics WHERE kobo_reading_state_id = 2) +
+                    (SELECT COUNT(*) FROM kobo_bookmark WHERE kobo_reading_state_id = 2)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(discarded_children, 0);
+    }
+
+    #[test]
+    fn child_insert_failure_rolls_back_data_and_keeps_foreign_keys_on() {
+        let mut conn = appdb_fixture(true);
+        insert_state(&conn, 1, 1);
+        insert_statistics(&conn, 1);
+        insert_read_link(&conn, 1);
+        insert_state(&conn, 2, 2);
+        let bookmark_id = insert_bookmark(&conn, 2, 5.0);
+        conn.execute(
+            "UPDATE kobo_reading_state SET current_bookmark = ?1 WHERE id = 2",
+            params![bookmark_id],
+        )
+        .unwrap();
+        insert_read_link(&conn, 2);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_statistics_insert
+             BEFORE INSERT ON kobo_statistics
+             BEGIN
+                SELECT RAISE(ABORT, 'injected statistics failure');
+             END;",
+        )
+        .unwrap();
+        let before = data_snapshot(&conn);
+
+        let error = fix_kobo_sync_issues(&mut conn).unwrap_err();
+
+        assert!(error.to_string().contains("injected statistics failure"));
+        assert_eq!(data_snapshot(&conn), before);
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn missing_current_bookmark_column_is_added_without_disabling_foreign_keys() {
+        let mut conn = appdb_fixture(false);
+
+        fix_kobo_sync_issues(&mut conn).unwrap();
+
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(kobo_reading_state)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "current_bookmark"));
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn duplicate_add_to_shelf_is_timestamp_preserving_and_creates_no_state() {
+        let mut conn = appdb_fixture(true);
+        conn.execute(
+            "INSERT INTO shelf
+                (id, uuid, name, is_public, user_id, kobo_sync, created, last_modified)
+             VALUES (1, 'shelf', 'Kobo', 0, 1, 1, 'created', 'unchanged-shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added)
+             VALUES (9, 1, 1, 'unchanged-link')",
+            [],
+        )
+        .unwrap();
+
+        add_existing_book_to_shelf(&mut conn, 9, "Kobo", Some("reader")).unwrap();
+
+        let values: (String, String) = conn
+            .query_row(
+                "SELECT s.last_modified, bsl.date_added
+                 FROM shelf s JOIN book_shelf_link bsl ON bsl.shelf = s.id
+                 WHERE s.id = 1 AND bsl.book_id = 9",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(values, ("unchanged-shelf".into(), "unchanged-link".into()));
+        let state_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kobo_reading_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state_count, 0);
+    }
+
+    #[test]
+    fn ordinary_batch_add_only_appends_memberships_with_strict_cursor_timestamps() {
+        let mut conn = appdb_fixture(true);
+        conn.execute(
+            "INSERT INTO shelf
+                (id, uuid, name, is_public, user_id, kobo_sync, created, last_modified)
+             VALUES (1, 'shelf', 'KoboMelissa', 0, 1, 1,
+                     '2020-01-01 00:00:00.000000', '2020-01-01 00:00:00.000000')",
+            [],
+        )
+        .unwrap();
+
+        for book_id in 1..=224 {
+            conn.execute(
+                "INSERT INTO book_shelf_link (book_id, shelf, \"order\", date_added)
+                 VALUES (?1, 1, ?1, ?2)",
+                params![
+                    book_id,
+                    format!("2020-01-01 00:00:00.{book_id:06}")
+                ],
+            )
+            .unwrap();
+        }
+        for state_id in 1..=125 {
+            conn.execute(
+                "INSERT INTO kobo_reading_state
+                    (id, user_id, book_id, last_modified, priority_timestamp, current_bookmark)
+                 VALUES (?1, 1, ?1, NULL, NULL, NULL)",
+                [state_id],
+            )
+            .unwrap();
+        }
+
+        let old_links: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT book_id, date_added FROM book_shelf_link
+                 WHERE book_id <= 224 ORDER BY book_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for book_id in 225..=349 {
+            add_book_to_shelf_in_appdb(
+                &mut conn,
+                book_id,
+                "KoboMelissa",
+                Some("reader"),
+            )
+            .unwrap();
+        }
+
+        let unchanged_links: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT book_id, date_added FROM book_shelf_link
+                 WHERE book_id <= 224 ORDER BY book_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(unchanged_links, old_links);
+
+        let added_timestamps: Vec<NaiveDateTime> = conn
+            .prepare(
+                "SELECT date_added FROM book_shelf_link
+                 WHERE book_id >= 225 ORDER BY book_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|timestamp| {
+                NaiveDateTime::parse_from_str(
+                    &timestamp.unwrap(),
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(added_timestamps.len(), 125);
+        assert!(added_timestamps.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let untouched_states: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kobo_reading_state
+                 WHERE last_modified IS NULL AND priority_timestamp IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched_states, 125);
+    }
+}
