@@ -33,11 +33,17 @@ pub enum Commands {
         #[clap(long)]
         shelf: Option<String>,
         /// The username to associate the shelf with. If not provided, uses the default admin user.
-        #[clap(long, help = "The username to associate the shelf with. If not provided, uses the default admin user.")]
+        #[clap(
+            long,
+            help = "The username to associate the shelf with. If not provided, uses the default admin user."
+        )]
         username: Option<String>,
         /// Show what would be done without making any changes
         #[clap(long)]
         dry_run: bool,
+        /// Succeed when a directory contains no EPUB files.
+        #[clap(long)]
+        allow_empty: bool,
     },
     /// List all books in the library with their attributes
     List {
@@ -65,8 +71,11 @@ pub enum Commands {
     InspectDb,
     /// Clean up orphaned data in both databases
     CleanDb,
-    /// Fix Kobo sync issues for books on Kobo shelves
-    FixKoboSync,
+    /// Reserved Kobo repair workflow; currently unavailable.
+    FixKoboSync {
+        #[command(subcommand)]
+        action: FixKoboSyncAction,
+    },
     /// Diagnose Kobo sync setup and show detailed information
     DiagnoseKoboSync,
     /// Add an existing book to a shelf (like Calibre-Web does)
@@ -81,4 +90,97 @@ pub enum Commands {
         #[clap(long)]
         username: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FixKoboSyncAction {
+    /// Reserved planning action; currently unavailable.
+    Plan {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        after_sync_attempt: Option<String>,
+    },
+    /// Reserved apply action; currently unavailable.
+    Apply {
+        #[arg(long)]
+        plan: String,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100))]
+        batch_size: u16,
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        acknowledge_unknown_kobo_cursor: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parses(arguments: &[&str]) -> bool {
+        Cli::try_parse_from(arguments).is_ok()
+    }
+
+    #[test]
+    fn fix_kobo_sync_accepts_exact_plan_and_apply_forms() {
+        assert!(parses(&[
+            "helper",
+            "fix-kobo-sync",
+            "plan",
+            "--username",
+            "melissa",
+        ]));
+        assert!(parses(&[
+            "helper",
+            "fix-kobo-sync",
+            "plan",
+            "--username",
+            "melissa",
+            "--after-sync-attempt",
+            "previous-plan",
+        ]));
+        assert!(parses(&[
+            "helper",
+            "fix-kobo-sync",
+            "apply",
+            "--plan",
+            "plan-id",
+            "--batch-size",
+            "100",
+            "--acknowledge-unknown-kobo-cursor",
+        ]));
+    }
+
+    #[test]
+    fn fix_kobo_sync_rejects_missing_values_ack_and_out_of_range_batches() {
+        assert!(!parses(&["helper", "fix-kobo-sync", "plan"]));
+        assert!(!parses(&[
+            "helper",
+            "fix-kobo-sync",
+            "apply",
+            "--batch-size",
+            "1",
+            "--acknowledge-unknown-kobo-cursor",
+        ]));
+        assert!(!parses(&[
+            "helper",
+            "fix-kobo-sync",
+            "apply",
+            "--plan",
+            "plan-id",
+            "--batch-size",
+            "1",
+        ]));
+        for invalid in ["0", "101"] {
+            assert!(!parses(&[
+                "helper",
+                "fix-kobo-sync",
+                "apply",
+                "--plan",
+                "plan-id",
+                "--batch-size",
+                invalid,
+                "--acknowledge-unknown-kobo-cursor",
+            ]));
+        }
+    }
 }

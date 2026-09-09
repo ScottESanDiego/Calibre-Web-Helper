@@ -39,7 +39,10 @@ pub(crate) struct UpdateChanges {
 
 impl UpdateChanges {
     pub(crate) fn has_any_changes(&self) -> bool {
-        self.pubdate_changed || self.series_index_changed || self.publisher_changed || self.series_changed
+        self.pubdate_changed
+            || self.series_index_changed
+            || self.publisher_changed
+            || self.series_changed
     }
 }
 
@@ -71,7 +74,10 @@ impl UpsertResult {
     }
 
     pub(crate) fn is_update(&self) -> bool {
-        matches!(self, UpsertResult::Updated { .. } | UpsertResult::NoChanges { .. })
+        matches!(
+            self,
+            UpsertResult::Updated { .. } | UpsertResult::NoChanges { .. }
+        )
     }
 
     pub(crate) fn skip_file_operations(&self) -> bool {

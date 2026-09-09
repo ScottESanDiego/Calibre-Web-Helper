@@ -1,34 +1,41 @@
+use crate::utils::{get_valid_filename, now_utc_micro};
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
-use crate::utils::{now_utc_micro, get_valid_filename};
 
 /// Cleans up orphaned data in both Calibre and Calibre-Web databases
-pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Option<&mut Connection>, calibre_library_path: &PathBuf) -> Result<()> {
+pub(crate) fn cleanup_databases(
+    metadata_conn: &mut Connection,
+    appdb_conn: Option<&mut Connection>,
+    calibre_library_path: &PathBuf,
+) -> Result<()> {
     println!("🧹 Starting database cleanup...");
-    
+
     // Get list of actual files in the Calibre library
     let mut existing_files = std::collections::HashSet::new();
     let mut book_paths = std::collections::HashSet::new();
-    
+
     // Walk the library directory
     for entry in walkdir::WalkDir::new(calibre_library_path)
         .follow_links(true)
         .into_iter()
-        .filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_file()
-                && let Ok(relative_path) = path.strip_prefix(calibre_library_path) {
-                    existing_files.insert(relative_path.to_path_buf());
-                    // Store the immediate parent directory if it contains a book file
-                    if let Some(parent) = relative_path.parent()
-                        && let Some(ext) = relative_path.extension() {
-                            let ext_lower = ext.to_ascii_lowercase();
-                            if ext_lower != "jpg" && ext_lower != "opf" {
-                                book_paths.insert(parent.to_path_buf());
-                            }
-                        }
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.is_file()
+            && let Ok(relative_path) = path.strip_prefix(calibre_library_path)
+        {
+            existing_files.insert(relative_path.to_path_buf());
+            // Store the immediate parent directory if it contains a book file
+            if let Some(parent) = relative_path.parent()
+                && let Some(ext) = relative_path.extension()
+            {
+                let ext_lower = ext.to_ascii_lowercase();
+                if ext_lower != "jpg" && ext_lower != "opf" {
+                    book_paths.insert(parent.to_path_buf());
                 }
+            }
+        }
     }
 
     // Start transaction for metadata DB cleanup
@@ -44,7 +51,7 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
     for book_result in book_iter {
         let (book_id, db_path) = book_result?;
         let path = PathBuf::from(&db_path);
-        
+
         // Check if the book's directory exists and contains files
         if !book_paths.contains(&path) {
             orphaned_books.push(book_id);
@@ -72,7 +79,7 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
                 let query = format!("DELETE FROM {} WHERE book = ?1", table);
                 tx.execute(&query, params![book_id])?;
             }
-            
+
             // Delete the book itself
             tx.execute("DELETE FROM books WHERE id = ?1", params![book_id])?;
             println!(" -> Removed orphaned book (ID: {})", book_id);
@@ -128,10 +135,12 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
     // Commit metadata DB changes
     tx.commit()?;
 
-        // Clean up Calibre-Web database if provided
+    // Clean up Calibre-Web database if provided
     if let Some(conn) = appdb_conn {
-        println!("
-🌐 Cleaning up Calibre-Web database...");
+        println!(
+            "
+🌐 Cleaning up Calibre-Web database..."
+        );
         let tx = conn.transaction()?;
 
         // Fix NULL datetime values that can cause TypeError
@@ -141,7 +150,10 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
             [],
         )?;
         if fixed > 0 {
-            println!(" -> Fixed {} shelf records with missing created timestamp", fixed);
+            println!(
+                " -> Fixed {} shelf records with missing created timestamp",
+                fixed
+            );
         }
 
         // Fix NULL last_modified values in shelf records
@@ -150,7 +162,10 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
             [],
         )?;
         if fixed > 0 {
-            println!(" -> Fixed {} shelf records with missing last_modified timestamp", fixed);
+            println!(
+                " -> Fixed {} shelf records with missing last_modified timestamp",
+                fixed
+            );
         }
 
         // Set both timestamps to current time if both are NULL
@@ -169,16 +184,17 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
             params![now_micro],
         )?;
         if fixed > 0 {
-            println!(" -> Fixed {} book shelf links with missing timestamp", fixed);
+            println!(
+                " -> Fixed {} book shelf links with missing timestamp",
+                fixed
+            );
         }
 
         // Get valid book IDs from Calibre database
         let mut valid_books = std::collections::HashSet::new();
         {
             let mut books_query = metadata_conn.prepare("SELECT id FROM books")?;
-            let book_iter = books_query.query_map([], |row| {
-                row.get::<_, i64>(0)
-            })?;
+            let book_iter = books_query.query_map([], |row| row.get::<_, i64>(0))?;
 
             for book_id in book_iter {
                 valid_books.insert(book_id?);
@@ -186,7 +202,8 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
         }
 
         // Build the valid book IDs list for SQLite IN clause
-        let valid_book_ids: String = valid_books.iter()
+        let valid_book_ids: String = valid_books
+            .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
@@ -199,10 +216,13 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
         };
 
         // First level: Clean up leaf tables that don't have dependencies
-        
+
         // Clean up downloads
         let deleted = tx.execute(
-            &format!("DELETE FROM downloads WHERE book_id NOT IN ({})", valid_book_ids),
+            &format!(
+                "DELETE FROM downloads WHERE book_id NOT IN ({})",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -211,7 +231,10 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
 
         // Clean up archived books
         let deleted = tx.execute(
-            &format!("DELETE FROM archived_book WHERE book_id NOT IN ({})", valid_book_ids),
+            &format!(
+                "DELETE FROM archived_book WHERE book_id NOT IN ({})",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -220,9 +243,12 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
 
         // Clean up Kobo bookmarks before reading state
         let deleted = tx.execute(
-            &format!("DELETE FROM kobo_bookmark WHERE kobo_reading_state_id IN (
+            &format!(
+                "DELETE FROM kobo_bookmark WHERE kobo_reading_state_id IN (
                 SELECT id FROM kobo_reading_state WHERE book_id NOT IN ({})
-            )", valid_book_ids),
+            )",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -231,9 +257,12 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
 
         // Clean up Kobo statistics before reading state
         let deleted = tx.execute(
-            &format!("DELETE FROM kobo_statistics WHERE kobo_reading_state_id IN (
+            &format!(
+                "DELETE FROM kobo_statistics WHERE kobo_reading_state_id IN (
                 SELECT id FROM kobo_reading_state WHERE book_id NOT IN ({})
-            )", valid_book_ids),
+            )",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -242,16 +271,25 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
 
         // Clean up Kobo reading state after its dependents
         let deleted = tx.execute(
-            &format!("DELETE FROM kobo_reading_state WHERE book_id NOT IN ({})", valid_book_ids),
+            &format!(
+                "DELETE FROM kobo_reading_state WHERE book_id NOT IN ({})",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
-            println!(" -> Removed {} orphaned Kobo reading state entries", deleted);
+            println!(
+                " -> Removed {} orphaned Kobo reading state entries",
+                deleted
+            );
         }
 
         // Clean up Kobo synced books
         let deleted = tx.execute(
-            &format!("DELETE FROM kobo_synced_books WHERE book_id NOT IN ({})", valid_book_ids),
+            &format!(
+                "DELETE FROM kobo_synced_books WHERE book_id NOT IN ({})",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -260,7 +298,10 @@ pub(crate) fn cleanup_databases(metadata_conn: &mut Connection, appdb_conn: Opti
 
         // Finally book shelf links and empty shelves
         let deleted = tx.execute(
-            &format!("DELETE FROM book_shelf_link WHERE book_id NOT IN ({})", valid_book_ids),
+            &format!(
+                "DELETE FROM book_shelf_link WHERE book_id NOT IN ({})",
+                valid_book_ids
+            ),
             [],
         )?;
         if deleted > 0 {
@@ -293,26 +334,33 @@ fn check_duplicate_books(tx: &rusqlite::Transaction) -> Result<()> {
          FROM books
          GROUP BY title, author_sort
          HAVING cnt > 1
-         ORDER BY title"
+         ORDER BY title",
     )?;
 
-    let dupes: Vec<(String, String, String, i64)> = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let dupes: Vec<(String, String, String, i64)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     if dupes.is_empty() {
         println!(" -> No duplicate books found.");
     } else {
         println!(" ⚠️  Found {} sets of duplicate books:", dupes.len());
         for (title, author_sort, ids, count) in &dupes {
-            println!("    '{}' by {} — {} copies (IDs: {})", title, author_sort, count, ids);
+            println!(
+                "    '{}' by {} — {} copies (IDs: {})",
+                title, author_sort, count, ids
+            );
         }
-        println!("    These are not automatically removed; review and delete manually with the 'delete' command.");
+        println!(
+            "    These are not automatically removed; review and delete manually with the 'delete' command."
+        );
     }
 
     Ok(())
@@ -327,17 +375,19 @@ fn check_missing_data_entries(tx: &rusqlite::Transaction) -> Result<()> {
          FROM books b
          LEFT JOIN data d ON b.id = d.book
          WHERE d.id IS NULL
-         ORDER BY b.title"
+         ORDER BY b.title",
     )?;
 
-    let missing: Vec<(i64, String, String, String)> = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let missing: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     if missing.is_empty() {
         println!(" -> All books have format data entries.");
@@ -361,20 +411,22 @@ fn check_data_name_mismatches(tx: &rusqlite::Transaction, library_dir: &Path) ->
         "SELECT d.id, d.book, d.name, d.format, b.path, b.title, b.author_sort
          FROM data d
          JOIN books b ON d.book = b.id
-         ORDER BY b.title"
+         ORDER BY b.title",
     )?;
 
-    let rows: Vec<(i64, i64, String, String, String, String, String)> = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<(i64, i64, String, String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut mismatch_count = 0;
     let mut missing_file_count = 0;
@@ -411,10 +463,16 @@ fn check_data_name_mismatches(tx: &rusqlite::Transaction, library_dir: &Path) ->
 
             if actual_files.is_empty() {
                 missing_file_count += 1;
-                println!("    ⚠️  ID {} — '{}' by {}: no book file found in {}", book_id, title, author, book_path);
+                println!(
+                    "    ⚠️  ID {} — '{}' by {}: no book file found in {}",
+                    book_id, title, author, book_path
+                );
             } else {
                 mismatch_count += 1;
-                println!("    ⚠️  ID {} — '{}' by {} (data.id {}):", book_id, title, author, data_id);
+                println!(
+                    "    ⚠️  ID {} — '{}' by {} (data.id {}):",
+                    book_id, title, author, data_id
+                );
                 println!("       Expected: {}", expected_filename);
                 println!("       Found:    {}", actual_files.join(", "));
 
@@ -427,15 +485,20 @@ fn check_data_name_mismatches(tx: &rusqlite::Transaction, library_dir: &Path) ->
                         .or_else(|| actual.strip_suffix(".epub"))
                         .or_else(|| actual.strip_suffix(".kepub"))
                         .unwrap_or(actual);
-                    tx.execute("UPDATE data SET name = ?1 WHERE id = ?2", params![stem, data_id])?;
+                    tx.execute(
+                        "UPDATE data SET name = ?1 WHERE id = ?2",
+                        params![stem, data_id],
+                    )?;
                     println!("       ✅ Fixed: updated data.name to '{}'", stem);
                 }
             }
         } else {
             // File exists — also verify data.name matches Calibre-Web naming convention
-            let expected_name = format!("{} - {}",
+            let expected_name = format!(
+                "{} - {}",
                 get_valid_filename(title, 42),
-                get_valid_filename(author, 42));
+                get_valid_filename(author, 42)
+            );
             if *data_name != expected_name {
                 // Only report if the file itself also doesn't match (avoid noise for legacy names)
                 let convention_path = book_dir.join(format!("{}.{}", expected_name, extension));
@@ -453,7 +516,10 @@ fn check_data_name_mismatches(tx: &rusqlite::Transaction, library_dir: &Path) ->
             println!(" -> Fixed {} filename mismatch(es).", mismatch_count);
         }
         if missing_file_count > 0 {
-            println!(" -> {} book(s) have a data record but no file on disk.", missing_file_count);
+            println!(
+                " -> {} book(s) have a data record but no file on disk.",
+                missing_file_count
+            );
         }
     }
 
@@ -465,60 +531,82 @@ fn check_missing_covers(tx: &rusqlite::Transaction, library_dir: &Path) -> Resul
     println!("\n🔍 Checking for missing cover images...");
 
     let mut stmt = tx.prepare(
-        "SELECT id, title, author_sort, path FROM books WHERE has_cover = 1 ORDER BY title"
+        "SELECT id, title, author_sort, path FROM books WHERE has_cover = 1 ORDER BY title",
     )?;
 
-    let books: Vec<(i64, String, String, String)> = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let books: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut missing_count = 0;
     for (book_id, title, author, book_path) in &books {
         let cover_path = library_dir.join(book_path).join("cover.jpg");
         if !cover_path.exists() {
             missing_count += 1;
-            println!("    ⚠️  ID {} — '{}' by {}: has_cover=1 but cover.jpg missing", book_id, title, author);
-            tx.execute("UPDATE books SET has_cover = 0 WHERE id = ?1", params![book_id])?;
+            println!(
+                "    ⚠️  ID {} — '{}' by {}: has_cover=1 but cover.jpg missing",
+                book_id, title, author
+            );
+            tx.execute(
+                "UPDATE books SET has_cover = 0 WHERE id = ?1",
+                params![book_id],
+            )?;
         }
     }
 
     if missing_count == 0 {
         println!(" -> All books with has_cover=1 have their cover.jpg file.");
     } else {
-        println!(" -> Fixed {} book(s): set has_cover=0 where cover.jpg was missing.", missing_count);
+        println!(
+            " -> Fixed {} book(s): set has_cover=0 where cover.jpg was missing.",
+            missing_count
+        );
     }
 
     // Also check the reverse: has_cover=0 but cover.jpg exists
     let mut stmt2 = tx.prepare(
-        "SELECT id, title, author_sort, path FROM books WHERE has_cover = 0 ORDER BY title"
+        "SELECT id, title, author_sort, path FROM books WHERE has_cover = 0 ORDER BY title",
     )?;
 
-    let books_no_cover: Vec<(i64, String, String, String)> = stmt2.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let books_no_cover: Vec<(i64, String, String, String)> = stmt2
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut found_count = 0;
     for (book_id, title, author, book_path) in &books_no_cover {
         let cover_path = library_dir.join(book_path).join("cover.jpg");
         if cover_path.exists() {
             found_count += 1;
-            println!("    ✅ ID {} — '{}' by {}: has_cover=0 but cover.jpg exists, fixing", book_id, title, author);
-            tx.execute("UPDATE books SET has_cover = 1 WHERE id = ?1", params![book_id])?;
+            println!(
+                "    ✅ ID {} — '{}' by {}: has_cover=0 but cover.jpg exists, fixing",
+                book_id, title, author
+            );
+            tx.execute(
+                "UPDATE books SET has_cover = 1 WHERE id = ?1",
+                params![book_id],
+            )?;
         }
     }
 
     if found_count > 0 {
-        println!(" -> Fixed {} book(s): set has_cover=1 where cover.jpg was found.", found_count);
+        println!(
+            " -> Fixed {} book(s): set has_cover=1 where cover.jpg was found.",
+            found_count
+        );
     }
 
     Ok(())

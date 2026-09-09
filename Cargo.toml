@@ -1,11 +1,11 @@
 [package]
 name = "calibre-web-helper"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["ScottESanDiego"]
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98.1"
 description = "A helper tool for managing Calibre and Calibre-Web libraries"
-license = "MIT"
+license = "BSD-2-Clause"
 repository = "https://github.com/ScottESanDiego/Calibre-Web-Helper"
 categories = ["command-line-utilities"]
 keywords = ["calibre", "ebook", "epub", "library", "metadata"]
@@ -13,13 +13,16 @@ keywords = ["calibre", "ebook", "epub", "library", "metadata"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rusqlite = { version = "0.39.0", features = ["chrono", "uuid", "functions", "bundled"] }
-epub = "2.1.5"
-clap = { version = "4.6.0", features = ["derive"] }
-chrono = "0.4.44"
-uuid = { version = "1.23.0", features = ["v4"] }
-anyhow = "1.0.102"
-walkdir = "2.5.0"
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-sha1 = "0.11.0"
-regex = "1.12.3"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["backup", "bundled", "chrono", "functions"] }
+rbook = { version = "=0.7.10", default-features = false }
+clap = { version = "=4.6.6", features = ["derive"] }
+chrono = "=0.4.45"
+uuid = { version = "=1.26.0", default-features = false, features = ["v4"] }
+anyhow = "=1.0.104"
+walkdir = "=2.5.0"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+sha2 = "=0.11.0"
+regex = "=1.13.1"
+
+[dev-dependencies]
+zip = { version = "=8.6.0", default-features = false }

@@ -23,8 +23,8 @@ pub(crate) fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Co
         anyhow::bail!("Database file does not exist: {:?}", path);
     }
 
-    let conn = Connection::open(path)
-        .with_context(|| format!("Failed to open database at {:?}", path))?;
+    let conn =
+        Connection::open(path).with_context(|| format!("Failed to open database at {:?}", path))?;
 
     if config.enable_foreign_keys {
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -32,8 +32,10 @@ pub(crate) fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Co
     }
 
     if config.busy_timeout_ms > 0 {
-        conn.busy_timeout(std::time::Duration::from_millis(config.busy_timeout_ms as u64))
-            .context("Failed to set busy timeout")?;
+        conn.busy_timeout(std::time::Duration::from_millis(
+            config.busy_timeout_ms as u64,
+        ))
+        .context("Failed to set busy timeout")?;
     }
 
     Ok(conn)
@@ -43,10 +45,10 @@ pub(crate) fn open_connection(path: &Path, config: &DatabaseConfig) -> Result<Co
 pub(crate) fn open_calibre_db(path: &Path) -> Result<Connection> {
     let config = DatabaseConfig::default();
     let conn = open_connection(path, &config)?;
-    
+
     // Add custom functions required by Calibre
     create_calibre_functions(&conn)?;
-    
+
     Ok(conn)
 }
 
@@ -73,12 +75,9 @@ fn create_calibre_functions(conn: &Connection) -> Result<()> {
     )?;
 
     // The book insert trigger also requires a uuid4 function
-    conn.create_scalar_function(
-        "uuid4",
-        0,
-        FunctionFlags::SQLITE_UTF8,
-        move |_ctx| Ok(Uuid::new_v4().to_string()),
-    )?;
+    conn.create_scalar_function("uuid4", 0, FunctionFlags::SQLITE_UTF8, move |_ctx| {
+        Ok(Uuid::new_v4().to_string())
+    })?;
 
     Ok(())
 }
@@ -95,8 +94,14 @@ mod tests {
     #[test]
     fn test_title_sort_logic() {
         assert_eq!(title_sort_logic("The Great Gatsby"), "Great Gatsby, The");
-        assert_eq!(title_sort_logic("A Tale of Two Cities"), "Tale of Two Cities, A");
-        assert_eq!(title_sort_logic("An American Tragedy"), "American Tragedy, An");
+        assert_eq!(
+            title_sort_logic("A Tale of Two Cities"),
+            "Tale of Two Cities, A"
+        );
+        assert_eq!(
+            title_sort_logic("An American Tragedy"),
+            "American Tragedy, An"
+        );
         assert_eq!(title_sort_logic("Normal Title"), "Normal Title");
         assert_eq!(title_sort_logic("Der Zauberberg"), "Zauberberg, Der");
         assert_eq!(title_sort_logic("Les Misérables"), "Misérables, Les");

@@ -1,21 +1,26 @@
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use regex::Regex;
-use rusqlite::{params, Transaction, Error as SqliteError, Connection, OptionalExtension};
-use anyhow::{Result, Context};
-use sha1::{Sha1, Digest};
+use rusqlite::{Connection, Error as SqliteError, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-static BAD_CHARS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[*+:\\"/<>?]+"#).expect("invalid regex"));
+static BAD_CHARS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[*+:\\"/<>?]+"#).expect("invalid regex"));
 static PIPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[|]+").expect("invalid regex"));
-static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^[\s\u{200B}-\u{200D}\u{FEFF}]+)|([\s\u{200B}-\u{200D}\u{FEFF}]+$)").expect("invalid regex"));
-static SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^((JR|SR)\.?|I{1,3}\.?|IV\.?)$").expect("invalid regex"));
+static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^[\s\u{200B}-\u{200D}\u{FEFF}]+)|([\s\u{200B}-\u{200D}\u{FEFF}]+$)")
+        .expect("invalid regex")
+});
+static SUFFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^((JR|SR)\.?|I{1,3}\.?|IV\.?)$").expect("invalid regex"));
 
 /// Format a timestamp with microsecond precision for database storage
 /// This matches the format used by both Calibre and Calibre-Web
-pub(crate) fn format_timestamp_micro<Tz: TimeZone>(dt: &DateTime<Tz>) -> String 
+pub(crate) fn format_timestamp_micro<Tz: TimeZone>(dt: &DateTime<Tz>) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -32,8 +37,8 @@ pub(crate) fn now_utc_micro() -> String {
 /// lookbehind `(?<=')` which the Rust regex crate doesn't support, so we
 /// handle the L' case by matching it with an optional trailing apostrophe.
 const TITLE_ARTICLES: &[&str] = &[
-    "A", "The", "An", "Der", "Die", "Das", "Den", "Ein", "Eine",
-    "Einen", "Dem", "Des", "Einem", "Eines", "Le", "La", "Les", "Un", "Une",
+    "A", "The", "An", "Der", "Die", "Das", "Den", "Ein", "Eine", "Einen", "Dem", "Des", "Einem",
+    "Eines", "Le", "La", "Les", "Un", "Une",
 ];
 
 /// Sanitize a string for use as a filename, matching Calibre-Web's `get_valid_filename()`.
@@ -168,7 +173,7 @@ pub(crate) fn set_metadata_dirty(conn: &Connection, book_id: i64) -> Result<()> 
 }
 
 /// Generic find-or-create pattern for database entities
-/// 
+///
 /// This pattern is used extensively throughout the codebase for entities like
 /// authors, publishers, series, etc. It tries to find an existing record,
 /// and if not found, creates a new one.
@@ -214,14 +219,8 @@ pub(crate) fn find_or_create_by_name(
         .map_err(|e| SqliteError::InvalidParameterName(e.to_string()))?;
     let find_query = format!("SELECT id FROM {} WHERE name = ?1", table_name);
     let insert_query = format!("INSERT INTO {} (name) VALUES (?1)", table_name);
-    
-    find_or_create(
-        tx,
-        &find_query,
-        params![name],
-        &insert_query,
-        params![name],
-    )
+
+    find_or_create(tx, &find_query, params![name], &insert_query, params![name])
 }
 
 /// Find-or-create for entities that have both name and sort fields
@@ -236,7 +235,7 @@ pub(crate) fn find_or_create_by_name_and_sort(
         .map_err(|e| SqliteError::InvalidParameterName(e.to_string()))?;
     let find_query = format!("SELECT id FROM {} WHERE name = ?1", table_name);
     let insert_query = format!("INSERT INTO {} (name, sort) VALUES (?1, ?2)", table_name);
-    
+
     find_or_create(
         tx,
         &find_query,
@@ -260,48 +259,6 @@ pub(crate) fn find_or_create_language(
     )
 }
 
-/// Verifies and repairs NULL timestamp values in the Calibre database.
-///
-/// Calibre-Web timestamps are intentionally excluded.  They participate in
-/// Kobo sync cursors, so changing unrelated app.db rows as a side effect of an
-/// ordinary command can make an unfixed Calibre-Web server repeat a sync page.
-pub(crate) fn verify_and_repair_timestamps(calibre_conn: &mut Connection) -> Result<()> {
-    // Fix timestamps in Calibre database
-    let tx = calibre_conn.transaction()?;
-    
-    // Get current timestamp with microsecond precision
-    let now = now_utc_micro();
-
-    // Fix NULL timestamps in books table
-    let fixed = tx.execute(
-        "UPDATE books SET timestamp = ?1 WHERE timestamp IS NULL",
-        [&now],
-    )?;
-    if fixed > 0 {
-        println!(" -> Fixed {} books with missing timestamp", fixed);
-    }
-
-    let fixed = tx.execute(
-        "UPDATE books SET pubdate = ?1 WHERE pubdate IS NULL",
-        [&now],
-    )?;
-    if fixed > 0 {
-        println!(" -> Fixed {} books with missing pubdate", fixed);
-    }
-
-    let fixed = tx.execute(
-        "UPDATE books SET last_modified = ?1 WHERE last_modified IS NULL",
-        [&now],
-    )?;
-    if fixed > 0 {
-        println!(" -> Fixed {} books with missing last_modified", fixed);
-    }
-
-    tx.commit()?;
-
-    Ok(())
-}
-
 /// Detect the book format and file extension from a path.
 /// Returns `(format, extension)` e.g. `("KEPUB", ".kepub")` or `("EPUB", ".epub")`.
 pub(crate) fn detect_book_format(path: &Path) -> Result<(&'static str, &'static str)> {
@@ -315,12 +272,12 @@ pub(crate) fn detect_book_format(path: &Path) -> Result<(&'static str, &'static 
     }
 }
 
-/// Calculate SHA1 hash of a file
+/// Calculate the transient SHA-256 hash of a file.
 pub(crate) fn calculate_file_hash(file_path: &Path) -> Result<String> {
     let mut file = File::open(file_path)?;
-    let mut hasher = Sha1::new();
+    let mut hasher = Sha256::new();
     let mut buffer = [0; 8192]; // 8KB buffer for reading chunks
-    
+
     loop {
         let bytes_read = file.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -328,9 +285,20 @@ pub(crate) fn calculate_file_hash(file_path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..bytes_read]);
     }
-    
+
     let hash = hasher.finalize();
-    Ok(hash.iter().map(|b| format!("{:02x}", b)).collect())
+    Ok(hex_digest(&hash))
+}
+
+pub(crate) fn calculate_bytes_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash = hasher.finalize();
+    hex_digest(&hash)
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Validates that an ID is positive and within reasonable bounds
@@ -339,7 +307,11 @@ pub(crate) fn validate_id(id: i64, entity_type: &str) -> Result<()> {
         anyhow::bail!("Invalid {} ID: {}. ID must be positive.", entity_type, id);
     }
     if id > i64::MAX / 2 {
-        anyhow::bail!("Invalid {} ID: {}. ID is unreasonably large.", entity_type, id);
+        anyhow::bail!(
+            "Invalid {} ID: {}. ID is unreasonably large.",
+            entity_type,
+            id
+        );
     }
     Ok(())
 }
@@ -350,31 +322,47 @@ pub(crate) fn validate_table_name(table_name: &str) -> Result<()> {
     if table_name.is_empty() {
         anyhow::bail!("Table name cannot be empty");
     }
-    
+
     if !table_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         anyhow::bail!(
             "Invalid table name '{}'. Only alphanumeric characters and underscores allowed.",
             table_name
         );
     }
-    
+
     // Check against known valid table names
     const VALID_TABLES: &[&str] = &[
-        "books", "authors", "publishers", "tags", "series", "languages",
-        "books_authors_link", "books_publishers_link", "books_tags_link",
-        "books_series_link", "books_languages_link", "identifiers",
-        "comments", "data", "shelf", "book_shelf_link", "user",
-        "kobo_reading_state", "kobo_bookmark", "kobo_statistics",
-        "kobo_synced_books", "book_read_link"
+        "books",
+        "authors",
+        "publishers",
+        "tags",
+        "series",
+        "languages",
+        "books_authors_link",
+        "books_publishers_link",
+        "books_tags_link",
+        "books_series_link",
+        "books_languages_link",
+        "identifiers",
+        "comments",
+        "data",
+        "shelf",
+        "book_shelf_link",
+        "user",
+        "kobo_reading_state",
+        "kobo_bookmark",
+        "kobo_statistics",
+        "kobo_synced_books",
+        "book_read_link",
     ];
-    
+
     if !VALID_TABLES.contains(&table_name) {
         anyhow::bail!(
             "Table name '{}' is not in the list of known valid tables",
             table_name
         );
     }
-    
+
     Ok(())
 }
 
@@ -383,14 +371,14 @@ pub(crate) fn validate_column_name(column_name: &str) -> Result<()> {
     if column_name.is_empty() {
         anyhow::bail!("Column name cannot be empty");
     }
-    
+
     if !column_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         anyhow::bail!(
             "Invalid column name '{}'. Only alphanumeric characters and underscores allowed.",
             column_name
         );
     }
-    
+
     Ok(())
 }
 
@@ -399,23 +387,26 @@ pub(crate) fn backup_database(db_path: &Path, operation_name: &str) -> Result<Pa
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!(
         "{}_backup_{}_{}.db",
-        db_path.file_stem()
+        db_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("database"),
         operation_name,
         timestamp
     );
-    
-    let backup_path = db_path.parent()
+
+    let backup_path = db_path
+        .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(backup_name);
-    
-    fs::copy(db_path, &backup_path)
-        .with_context(|| format!(
+
+    fs::copy(db_path, &backup_path).with_context(|| {
+        format!(
             "Failed to create backup of {:?} to {:?}",
             db_path, backup_path
-        ))?;
-    
+        )
+    })?;
+
     println!(" -> Created database backup: {:?}", backup_path);
     Ok(backup_path)
 }
@@ -429,57 +420,27 @@ pub(crate) fn validate_foreign_key(
 ) -> Result<()> {
     validate_table_name(table_name)?;
     validate_id(id, entity_type)?;
-    
+
     let query = format!("SELECT 1 FROM {} WHERE id = ?1", table_name);
     let exists: bool = conn
         .query_row(&query, params![id], |_| Ok(true))
         .optional()
-        .with_context(|| format!(
-            "Failed to validate {} with ID {} in table {}",
-            entity_type, id, table_name
-        ))?
+        .with_context(|| {
+            format!(
+                "Failed to validate {} with ID {} in table {}",
+                entity_type, id, table_name
+            )
+        })?
         .is_some();
-    
+
     if !exists {
         anyhow::bail!(
             "{} with ID {} does not exist in table {}",
-            entity_type, id, table_name
+            entity_type,
+            id,
+            table_name
         );
     }
-    
+
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn timestamp_repair_updates_only_calibre_books() {
-        let mut calibre_conn = Connection::open_in_memory().unwrap();
-        calibre_conn
-            .execute_batch(
-                "CREATE TABLE books (
-                    id INTEGER PRIMARY KEY,
-                    timestamp TEXT,
-                    pubdate TEXT,
-                    last_modified TEXT
-                 );
-                 INSERT INTO books VALUES (1, NULL, NULL, NULL);",
-            )
-            .unwrap();
-
-        verify_and_repair_timestamps(&mut calibre_conn).unwrap();
-
-        let timestamps: (Option<String>, Option<String>, Option<String>) = calibre_conn
-            .query_row(
-                "SELECT timestamp, pubdate, last_modified FROM books WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert!(timestamps.0.is_some());
-        assert!(timestamps.1.is_some());
-        assert!(timestamps.2.is_some());
-    }
 }
